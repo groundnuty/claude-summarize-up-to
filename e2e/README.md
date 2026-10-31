@@ -18,7 +18,7 @@ Claude Code keeps a message or two before the cut in addition to what the mod ha
 
 ## Requirements
 
-- tmux, Python 3, and the Claude Code release under test on `PATH`.
+- tmux, Python 3, and the Claude Code release under test on `PATH`, or named by `CLAUDE_BIN=/path/to/claude`.
 - A login where compaction reaches user mods. That means a personal account on a machine without managed settings: Team and Enterprise logins seat Claude Code's security default, which keeps compaction away from user mods. `/summarize-up-to status` tells you which you have.
 - Network access for `claude-haiku-5-5`. A pair of runs costs a few cents.
 
@@ -26,8 +26,8 @@ The test sessions read none of your own settings. They run with `--setting-sourc
 
 ## After a run
 
-The tmux session is closed (keep it with `--keep`). The test folder and its `debug.txt` stay in `/tmp/sut-e2e-*`. The transcripts stay where Claude Code writes them, `~/.claude/projects/-private-tmp-sut-e2e-*`. The run prints both paths. Remove them when you no longer need them:
+The tmux session is closed (keep it with `--keep`). The test folder and its `debug.txt` stay in `/tmp/sut-e2e-*`. The transcripts stay where Claude Code writes them: `~/.claude/projects/-private-tmp-sut-e2e-*` on macOS, `~/.claude/projects/-tmp-sut-e2e-*` on Linux. The run prints both paths. Remove them when you no longer need them:
 
 ```
-rm -r /tmp/sut-e2e-* ~/.claude/projects/-private-tmp-sut-e2e-*
+rm -r /tmp/sut-e2e-* ~/.claude/projects/-*tmp-sut-e2e-*
 ```

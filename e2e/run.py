@@ -27,6 +27,8 @@ WORDS = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT", "GOLF", "HOTEL
          "MIKE", "NOVEMBER", "OSCAR", "PAPA"]
 WORD_RE = re.compile(r"\b(" + "|".join(WORDS) + r")\b")
 MODEL = "claude-haiku-5-5"
+# The Claude Code binary under test; set CLAUDE_BIN where `claude` is not on PATH.
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 # Text that only a dialog shows. The driver never types while one is up.
 DIALOG = ("Enter to continue", "Esc to cancel", "Do you want", "(y/n)", "❯ 1.", "❯ 2.", "Press Enter to")
 TRUST = ("trust the files in this folder", "Yes, I trust this folder", "Is this a project you")
@@ -43,7 +45,7 @@ class Session:
         self.name, self.cwd, self.log = name, cwd, log
         self.projects = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd)))
         tmux("kill-session", "-t", name)
-        command = " ".join(["env"] + [f"{k}={v}" for k, v in env.items()] + ["claude"] + [quote(a) for a in args])
+        command = " ".join(["env"] + [f"{k}={v}" for k, v in env.items()] + [CLAUDE] + [quote(a) for a in args])
         tmux("new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", cwd, command)
         self.started = time.time()
         deadline = time.time() + 60
