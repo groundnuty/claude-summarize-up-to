@@ -83,22 +83,38 @@ let applied: Cut | undefined
 // Set while the compaction hook cuts, and until the next compaction, for its
 // catch handler.
 let cutting = false
-// Whether any compaction has reached the hook this session. Claude Code's
-// built-in security default (cc-plugin-sec-default, seated in Team and
-// Enterprise organizations and on machines with managed settings) passes
-// session.compact past user plugins; a cut started there would summarize the
-// whole conversation, so the command refuses until a compaction shows up.
+// Whether compaction reaches this mod. Claude Code's built-in security default
+// (cc-plugin-sec-default, seated in Team and Enterprise organizations and on
+// machines with managed settings) passes session.compact past user plugins,
+// and settings.read with it; a cut started there would summarize the whole
+// conversation. Seeing either event proves the default does not stand in the
+// way; the command probes with a settings read before it gives up.
 let reached = false
+const reachedNow = (): boolean => reached
 
 // The userConfig options, read at each (re)load: /config changes reload.
 const DEFAULT_PERCENT = 65
 let auto = { isOn: false, percent: DEFAULT_PERCENT }
 
 const UNREACHED = [
-  'Not run: no compaction has reached this mod in this session, so it cannot tell whether it can cut one.',
-  "Where Claude Code's built-in security default (cc-plugin-sec-default) is seated, in Team and Enterprise organizations and on machines with managed settings, compaction skips user mods, and this would summarize the whole conversation.",
+  "Not run: in this session Claude Code keeps compaction away from user mods, so a cut would summarize the whole conversation.",
+  "That is Claude Code's built-in security default (cc-plugin-sec-default), seated in Team and Enterprise organizations and on machines with managed settings.",
   'An administrator can seat the mod ahead of it with managed prependPlugins.',
 ].join('\n')
+
+// A settings read raises settings.read, which the security default passes
+// over exactly where it passes over session.compact.
+async function probe($: EngineInterface): Promise<boolean> {
+  if (!reachedNow()) {
+    try {
+      await $.settings.read()
+    } catch {
+      // A read that fails proves nothing either way.
+    }
+  }
+
+  return reachedNow()
+}
 // Read through calls: the compaction hook changes both while we await.
 const appliedCut = (): Cut | undefined => applied
 const armedCut = (): Armed | undefined => armed
@@ -140,6 +156,13 @@ export const register: Register = (on, options) => {
     percent: typeof options.summarize_percent === 'number' ? options.summarize_percent : DEFAULT_PERCENT,
   }
 
+  // Observe only: every read gets the engine's answer unchanged.
+  on('settings.read', ($, e, next) => {
+    reached = true
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: NAME,
@@ -160,18 +183,20 @@ export const register: Register = (on, options) => {
       return { text: had ? 'Armed cut dropped; /compact summarizes the whole conversation again.' : 'No cut was armed.' }
     }
     if (ask.kind === 'status') {
-      const { context } = await $.session.usage({ breakdown: 'summary' })
-      const window = context.breakdown
+      const context = await $.session.usage({ breakdown: 'summary' }).then(u => u.context, () => undefined)
+      const window = context?.breakdown
       const at =
-        window === undefined || !window.isAutoCompactEnabled || window.autoCompactThreshold === undefined
-          ? 'auto-compaction is off'
-          : `Claude Code auto-compacts at ${Math.round(window.autoCompactThreshold / 1000)}k tokens (${Math.round((100 * window.autoCompactThreshold) / window.rawMaxTokens)}% of ${Math.round(window.rawMaxTokens / 1000)}k)`
+        context === undefined
+          ? 'the auto-compaction threshold is unknown'
+          : window === undefined || !window.isAutoCompactEnabled || window.autoCompactThreshold === undefined
+            ? 'auto-compaction is off'
+            : `Claude Code auto-compacts at ${Math.round(window.autoCompactThreshold / 1000)}k tokens (${Math.round((100 * window.autoCompactThreshold) / window.rawMaxTokens)}% of ${Math.round(window.rawMaxTokens / 1000)}k)`
 
       return {
         text: [
           `Partial auto-compaction: ${auto.isOn ? `on, summarizing the oldest ${auto.percent}%` : 'off'} (/config: ${NAME} options).`,
-          `${at}; the context is ${context.percent ?? '?'}% full. Set the threshold with /autocompact, e.g. /autocompact 900k.`,
-          reached ? 'Compaction reaches this mod in this session.' : UNREACHED,
+          `${at}; the context is ${context?.percent ?? '?'}% full. Set the threshold with /autocompact, e.g. /autocompact 900k.`,
+          (await probe($)) ? 'Compaction reaches this mod in this session.' : UNREACHED,
           ...(armed !== undefined ? ['A cut is armed for the next /compact.'] : []),
         ].join('\n'),
       }
@@ -179,8 +204,9 @@ export const register: Register = (on, options) => {
 
     const rows = liveRows(await $.session.messages())
     const cuts = cutsOf(rows)
-    if (ask.kind === 'list') return { text: `${listing(cuts)}\n\n${reached ? 'Compaction reaches this mod in this session.' : UNREACHED}` }
-    if (!reached) return { text: UNREACHED }
+    const isReached = await probe($)
+    if (ask.kind === 'list') return { text: `${listing(cuts)}\n\n${isReached ? 'Compaction reaches this mod in this session.' : UNREACHED}` }
+    if (!isReached) return { text: UNREACHED }
 
     const chosen =
       ask.kind === 'percent' ? pick(await stepsOf($, rows), { percent: ask.percent }) : cuts[ask.ordinal - 1]

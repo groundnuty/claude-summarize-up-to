@@ -39,22 +39,24 @@ const ROWS: SessionMessage[] = [
   assistant('v'.repeat(100), 'h7'),
 ]
 
-test('until a compaction has reached the mod, it refuses to cut', async ($, on) => {
-  let isCompacted = false
+// The refusal itself needs Claude Code's security default seated, which the
+// test kit has no way to seat; here the probe is the only path.
+test('with no compaction yet, a settings read shows a cut can apply, and the cut goes ahead', async ($, on) => {
+  let reads = 0
   mock.clock(on)
   on('session.messages', () => ({ value: ROWS }))
-  on('session.compact', () => {
-    isCompacted = true
+  on('settings.read', (_, e, next) => {
+    reads++
 
-    return { skip: 'test' }
+    return next(e)
   })
 
-  const ran = await $.command.run(typed('70%'))
+  const ran = await $.command.run(typed('#2'))
   const listed = await $.command.run(typed(''))
 
-  expect(ran.text).toMatch(/^Not run: no compaction has reached this mod/)
-  expect(listed.text).toMatch(/cc-plugin-sec-default/)
-  expect(isCompacted).toBe(false)
+  expect(reads).toBeGreaterThan(0)
+  expect(ran.text).toMatch(/^Summarizing everything before the peer message/)
+  expect(listed.text).toMatch(/Compaction reaches this mod in this session/)
 })
 
 test('peer messages are cut points; tool results and the first message are not', () => {
