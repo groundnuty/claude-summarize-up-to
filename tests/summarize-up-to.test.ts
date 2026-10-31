@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { SessionCompactInput, SessionMessage } from 'claude-code'
 
-import { continuationsOf, cutsOf, sizeOf, weightsOf } from '../hooks/cut'
+import { CLOSING, continuationsOf, cutsOf, sizeOf, weightsOf } from '../hooks/cut'
 
 const peer = (name: string, body: string): string =>
   `Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/${name}.sock" from-name="${name}">\n${body}\n</cross-session-message>`
@@ -89,7 +89,10 @@ test('a cut summarizes only what comes before it and keeps the rest whole', asyn
   // transcript, each message carrying its handle, with notes of its own.
   const done = await $.session.compact({ trigger: 'manual', messages: ROWS, instructions: 'mention the deadline' })
 
-  expect(seen?.messages.map(m => m.handle)).toEqual(['h0', 'h1', 'h2', 'h3', 'h4', 'h5'])
+  // What precedes the cut, closed by the mod's own message: Claude Code keeps
+  // the last assistant message out of the summary, and this one is that.
+  expect(seen?.messages.map(m => m.handle ?? m.text)).toEqual(['h0', 'h1', 'h2', 'h3', 'h4', 'h5', CLOSING])
+  expect(seen?.instructions).toMatch(/^Your only task is the summary\./)
   expect(seen?.instructions).toMatch(/It starts with this message, which you have not seen:\n"@critic: second result"/)
   expect(seen?.instructions).toMatch(/Also: keep the API decisions\nmention the deadline/)
   expect(done.messages?.map(m => m.handle ?? m.text)).toEqual(['SUMMARY', 'h6', 'h7'])
@@ -152,7 +155,7 @@ test('with no prompt to cut at, a percentage cuts between steps and keeps each t
   expect(ran.text).toMatch(/Type \/compact to go ahead, or \/summarize-up-to cancel\.$/)
 
   const done = await $.session.compact({ trigger: 'manual', messages: SOLO })
-  const head = seen?.messages ?? []
+  const head = (seen?.messages ?? []).filter(m => m.text !== CLOSING)
   const tail = (done.messages ?? []).slice(1)
 
   // Cut mid-run, after a tool result and before the next assistant message.
@@ -219,8 +222,9 @@ test('a step never cuts inside a batch of parallel tool calls', async ($, on) =>
   await $.session.compact({ trigger: 'manual', messages: BATCH })
 
   // A cut happened, and not between p4 and p5, the two halves of one message.
-  expect(seen?.messages.length).toBeLessThan(BATCH.length)
-  expect(seen?.messages.at(-1)?.handle).not.toBe('p4')
+  const head = (seen?.messages ?? []).filter(m => m.text !== CLOSING)
+  expect(head.length).toBeLessThan(BATCH.length)
+  expect(head.at(-1)?.handle).not.toBe('p4')
 })
 
 test('the person\'s /compact applies the armed cut and says so', async ($, on) => {
@@ -281,12 +285,9 @@ test('with partial auto-compaction on, an auto-compaction keeps the newest 35% v
   })
 
   const done = await $.session.compact({ trigger: 'auto', messages: SOLO })
-  const head = seen?.messages ?? []
+  const head = (seen?.messages ?? []).filter(m => m.text !== CLOSING)
   const tail = (done.messages ?? []).slice(1)
-  // Claude Code also keeps the last assistant message before the cut: the
-  // share summarized is what precedes that one.
-  const kept = head.findLastIndex(r => r.role === 'assistant')
-  const share = Math.round((100 * head.slice(0, kept).reduce((n, r) => n + sizeOf(r), 0)) / SOLO.reduce((n, r) => n + sizeOf(r), 0))
+  const share = Math.round((100 * head.reduce((n, r) => n + sizeOf(r), 0)) / SOLO.reduce((n, r) => n + sizeOf(r), 0))
 
   expect(Math.abs(share - 65)).toBeLessThanOrEqual(8)
   expect([...head, ...tail].map(r => r.handle)).toEqual(SOLO.map(r => r.handle))
@@ -411,22 +412,30 @@ test('shares follow what the model reads, and tokens come from Claude Code\'s co
 
   const ran = await $.command.run(typed('#1'))
   expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the you message at (8[6-9]|9\d)% /)
-  // Claude Code keeps the first reply too: one message summarized, five kept.
-  expect(ran.text).toMatch(/Summarized: 1 message \(86%, about 60k tokens\)\. Kept verbatim: 5 messages \(14%, about 10k tokens\)\./)
-  expect(ran.text).toMatch(/Claude Code also keeps the last reply before the cut, so the kept part starts 1 message earlier/)
+  expect(ran.text).toMatch(/Summarized: 2 messages \(91%, about 64k tokens\)\. Kept verbatim: 4 messages \(9%, about 6k tokens\)\./)
   expect(ran.text).toMatch(/Shares are of what the model reads: about 70k tokens of conversation by Claude Code's count\./)
 })
 
 test('a step that opens on thinking alone is shown by what it calls', () => {
   const rows: SessionMessage[] = [
     user('Run the tests', 'q0'),
-    assistant('', 'q1'),
-    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'm', tool: 'Bash', input: { command: 'make test' } }], handle: 'q2' },
-    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'm', text: 'ok', isError: false }], handle: 'q3' },
-    assistant('All tests pass.', 'q4'),
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Bash', input: { command: 'make' } }], handle: 'q1' },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'b', text: 'built', isError: false }], handle: 'q2' },
+    assistant('', 'q3'),
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'm', tool: 'Bash', input: { command: 'make test' } }], handle: 'q4' },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'm', text: 'ok', isError: false }], handle: 'q5' },
+    assistant('All tests pass.', 'q6'),
   ]
 
   expect(cutsOf(rows, { steps: true }).map(cut => cut.preview)).toEqual(['calls Bash: make test', 'All tests pass.'])
+})
+
+test('a prompt stays with the reply it asked for: no step right after a prompt', () => {
+  // A cut between them left the summarizer's part ending on a request
+  // answered only after the cut.
+  const rows: SessionMessage[] = [user('Describe Cappadocia', 'c0'), assistant('Cappadocia is…', 'c1'), user('Now Carcassonne', 'c2'), assistant('Carcassonne is…', 'c3')]
+
+  expect(cutsOf(rows, { steps: true }).map(cut => [cut.index, cut.kind])).toEqual([[2, 'you']])
 })
 
 const said = (text: string, kind = 'composer') => ({ text, origin: { kind }, wait: false }) as never
@@ -542,10 +551,10 @@ test('shares stay in step when prompts open alike and replies open on one word',
   ])
 
   // A cut at each turn's prompt summarizes everything the model read before
-  // the reply kept with it, the attachment included.
+  // it, the attachment included.
   const sizes = api.map(m => m.content.reduce((n, b) => n + b.text.length, 0))
   const total = sizes.reduce((a, b) => a + b, 0)
-  const expected = [1, 2, 3].map(turn => Math.round((100 * sizes.slice(0, 2 * turn - 1).reduce((a, b) => a + b, 0)) / total))
+  const expected = [1, 2, 3].map(turn => Math.round((100 * sizes.slice(0, 2 * turn).reduce((a, b) => a + b, 0)) / total))
   expect(cutsOf(rows, { weights: weightsOf(rows, api) }).map(cut => cut.percent)).toEqual(expected)
   expect(expected[0]).toBeGreaterThan(50)
 })
@@ -593,9 +602,79 @@ test('shares stay in step across a batch of parallel tool calls', () => {
 
   const weights = weightsOf(rows, api)
   expect(weights).toBeDefined()
-  // A cut at the second prompt keeps the reply before it: everything up to
-  // that reply's message, the batch's results included, is summarized.
+  // A cut at the second prompt summarizes everything before its message, the
+  // batch's results included.
   const sizes = [25, 4, 6000, 25, 29, 30]
   const total = sizes.reduce((a, b) => a + b, 0)
-  expect(cutsOf(rows, { weights }).map(cut => cut.percent)).toEqual([Math.round((100 * (25 + 4 + 6000)) / total)])
+  expect(cutsOf(rows, { weights }).map(cut => cut.percent)).toEqual([Math.round((100 * (25 + 4 + 6000 + 25)) / total)])
+})
+
+test('with partial auto-compaction on, a precompute is declined; off, it passes through', AUTO, async ($, on) => {
+  const triggers: string[] = []
+  on('session.messages', (_, e) => ({ value: e.as === 'api' ? ([] as never) : SOLO }))
+  on('session.compact', (_, e) => {
+    triggers.push(e.trigger)
+
+    return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
+  })
+
+  // Claude Code would install a precomputed full summary at the threshold
+  // without asking again: declined, the threshold's compaction comes as auto.
+  const ahead = await $.session.compact({ trigger: 'precompute', messages: SOLO })
+  expect(ahead.skip).toMatch(/cuts each auto-compaction when it runs/)
+  expect(triggers).toEqual([])
+})
+
+test('without partial auto-compaction, a precompute passes through whole', async ($, on) => {
+  let seen: SessionCompactInput | undefined
+  on('session.compact', (_, e) => {
+    seen = e
+
+    return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
+  })
+
+  await $.session.compact({ trigger: 'precompute', messages: SOLO })
+  expect(seen?.messages.length).toBe(SOLO.length)
+})
+
+test('after a cut, the mod says what Claude Code kept of the part before it', async ($, on) => {
+  const logs: string[] = []
+  mock.clock(on)
+  on('session.messages', () => ({ value: ROWS }))
+  on('session.id', () => ({ value: 'S1' }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '{"fixed": 0, "reaches": true, "covered": 3, "total": 3}', stderr: '' } }) as never)
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+
+    return { value: undefined }
+  })
+  // Core hands back its summary and the last two messages it was given, kept:
+  // the real reply and the mod's closing message, stamped with a handle as
+  // Claude Code does.
+  on('session.compact', (_, e) => ({
+    messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }, ...e.messages.slice(-2).map(m => ({ ...m, handle: m.handle ?? 'k1' }))],
+  }))
+
+  await $.command.run(typed('#2'))
+  const done = await $.session.compact({ trigger: 'manual', messages: ROWS })
+
+  // The closing message is dropped; the real reply stays, and is reported.
+  expect(done.messages?.map(m => m.handle ?? m.text)).toEqual(['SUMMARY', 'h5', 'h6', 'h7'])
+  const said = logs.find(text => text.startsWith('summarized everything before'))
+  expect(said).toMatch(/and so is the message before it, which Claude Code kept: verbatim text starts at "w+…"\.$/)
+})
+
+test('the confirmation counts tokens with the token-count API where Claude Code offers it', async ($, on) => {
+  const asked: (string | undefined)[] = []
+  on('session.messages', (_, e) => ({ value: e.as === 'api' ? READ_API : READ }))
+  on('session.usage', (_, e) => {
+    asked.push(e.breakdown)
+    const tokens = e.breakdown === 'full' ? 90000 : 60000
+
+    return { value: { context: { window: 200000, tokens, percent: 45, breakdown: { categories: [{ name: 'Messages', kind: 'used', tokens }] } } } as never }
+  })
+
+  const ran = await $.command.run(typed('#1'))
+  expect(asked[0]).toBe('full')
+  expect(ran.text).toMatch(/about 90k tokens of conversation by Claude Code's count/)
 })

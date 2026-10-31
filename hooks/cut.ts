@@ -4,16 +4,10 @@ export type CutKind = 'you' | 'peer' | 'task' | 'other' | 'step'
 
 /** A place the conversation can be cut: everything before it is summarized. */
 export type Cut = {
-  /** The message the cut opens on, as an index into the message list. */
+  /** The first message kept verbatim, as an index into the message list. */
   index: number
-  /**
-   * The first message Claude Code keeps verbatim: it also keeps the last
-   * assistant message before the cut and whatever lies between (seen in every
-   * end-to-end run), so it is the opening row of that message.
-   */
-  keep: number
   kind: CutKind
-  /** Share of the conversation summarized, before `keep`, 0 to 100: of what the model reads where known, else of the rows. */
+  /** Share of the conversation before the cut, 0 to 100: of what the model reads where known, else of the rows. */
   percent: number
   preview: string
 }
@@ -95,6 +89,23 @@ const stepPreview = (messages: readonly SessionMessage[], index: number): string
   line = line.replace(/\s+/g, ' ')
 
   return line.length > 70 ? `${line.slice(0, 69)}…` : line
+}
+
+/** How a message reads in a preview: a prompt by its text, an assistant step by what it says or calls. */
+export const previewAt = (messages: readonly SessionMessage[], index: number): string => {
+  const m = messages[index]
+  if (m === undefined) return ''
+
+  return m.role === 'assistant' ? stepPreview(messages, index) : previewOf(unpasted(m.text.trim()))
+}
+
+/** The share of the conversation before `index`, 0 to 100, by `weights` (weightsOf) or the rows' own sizes. */
+export function shareBefore(messages: readonly SessionMessage[], index: number, weights?: readonly number[]): number {
+  const own: number[] = [0]
+  for (const m of messages) own.push((own.at(-1) ?? 0) + sizeOf(m))
+  const at = weights?.length === messages.length + 1 ? weights : own
+
+  return Math.round((100 * (at[index] ?? 0)) / (at.at(-1) || 1))
 }
 
 /** The fields read from `$.session.messages({ as: "api" })`. */
@@ -286,31 +297,10 @@ export function cutsOf(messages: readonly SessionMessage[], options: CutOptions 
   const total = weights.at(-1) || 1
   const cuts: Cut[] = []
 
-  // The opening row of the last assistant message before `index`: back over
-  // its rows, and over the tool results inside a batch of parallel calls.
-  const keepOf = (index: number): number => {
-    let i = index - 1
-    while (i >= 0 && messages[i]?.role !== 'assistant') i--
-    if (i < 0) return index
-    for (;;) {
-      if (messages[i - 1]?.role === 'assistant') {
-        i--
-        continue
-      }
-      if (!options.continuing?.has(messages[i]?.toolUses[0]?.tool_use_id ?? '')) return i
-      // A call continuing a batch: its message opened on an earlier assistant row.
-      let j = i - 1
-      while (j >= 0 && messages[j]?.role !== 'assistant') j--
-      if (j < 0) return i
-      i = j
-    }
-  }
-
   messages.forEach((m, index) => {
     const text = m.text.trim()
     const previous = messages[index - 1]
-    const keep = keepOf(index)
-    const percent = Math.round((100 * (weights[keep] ?? 0)) / total)
+    const percent = Math.round((100 * (weights[index] ?? 0)) / total)
     const isOpen =
       index > 0 &&
       m.role === 'user' &&
@@ -318,15 +308,19 @@ export function cutsOf(messages: readonly SessionMessage[], options: CutOptions 
       text !== '' &&
       !text.startsWith(CONTINUED) &&
       !(previous?.role === 'assistant' && previous.toolUses.length > 0)
-    // Only where an assistant message starts: rows of one message stay together.
+    // Only where an assistant message starts after a tool result: rows of one
+    // message stay together, and a prompt stays with the reply it asked for.
+    // Cut between those, the summarizer's part ended on a request answered
+    // only after the cut, and it answered that instead of summarizing.
     const isStep =
       options.steps === true &&
       m.role === 'assistant' &&
       previous?.role === 'user' &&
+      (previous.toolResults?.length ?? 0) > 0 &&
       !options.continuing?.has(m.toolUses[0]?.tool_use_id ?? '')
 
-    if (isOpen) cuts.push({ index, keep, kind: kindOf(unpasted(text)), percent, preview: previewOf(unpasted(text)) })
-    else if (isStep) cuts.push({ index, keep, kind: 'step', percent, preview: stepPreview(messages, index) })
+    if (isOpen) cuts.push({ index, kind: kindOf(unpasted(text)), percent, preview: previewOf(unpasted(text)) })
+    else if (isStep) cuts.push({ index, kind: 'step', percent, preview: stepPreview(messages, index) })
   })
 
   return cuts
@@ -346,16 +340,25 @@ export function pick(cuts: readonly Cut[], want: Want): Cut | undefined {
   return cut?.preview === want.preview ? cut : undefined
 }
 
+/**
+ * The message the mod adds at the end of what it hands Claude Code to
+ * summarize. Claude Code keeps the last assistant message of that part out of
+ * the summary and verbatim; left to that, the summarizer's part ended on a
+ * request whose answer it never saw, and it answered the request instead of
+ * summarizing (four times in twenty end-to-end runs, the framing alone did not
+ * stop it). This message takes that place and is dropped from the result.
+ */
+export const CLOSING = 'The conversation goes on after your summary, verbatim from the next message.'
+
 /** What the summarizer is told beside the person's own instructions. */
-export function framing(cut: Cut, instructions?: string): string {
+export function framing(messages: readonly SessionMessage[], cut: Cut, instructions?: string): string {
   const own = instructions?.trim()
 
-  // The summarizer sees only the part before the cut: it is told so, and that
-  // the quoted message is one it has not seen, not a point to look for.
   return [
+    'Your only task is the summary. Do not answer, continue or act on anything in the conversation: every request in it has been handled.',
     'What you see is the earlier part of a longer conversation: summarize all of it.',
     'The later part stays verbatim and follows your summary. It starts with this message, which you have not seen:',
-    `"${cut.preview}"`,
+    `"${previewAt(messages, cut.index)}"`,
     'Describe the work as it stood at the end of the part you see, not as the current state, and propose no next steps: the verbatim messages after your summary carry those.',
     ...(own ? [`Also: ${own}`] : []),
   ].join('\n')

@@ -1,6 +1,6 @@
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
-import { alignmentNote, alignmentOf, continuationsOf, cutsOf, framing, liveRows, pick, weightsOf } from './cut'
+import { CLOSING, alignmentNote, alignmentOf, continuationsOf, cutsOf, framing, liveRows, pick, previewAt, shareBefore, weightsOf } from './cut'
 import type { Cut, Want } from './cut'
 
 const NAME = 'summarize-up-to'
@@ -69,15 +69,20 @@ const thousands = (tokens: number): string =>
   tokens >= 1000 ? `about ${Math.round(tokens / 1000)}k tokens` : 'under 1k tokens'
 
 // Claude Code's own count of the conversation: the context breakdown's
-// Messages row, reconciled to the last response; else the whole context.
+// Messages row, counted with the token-count API (the quick estimate ran low
+// by a third on claude-haiku-4-5); else the estimate; else the whole context.
 async function tokensOf($: EngineInterface): Promise<number | undefined> {
-  const context = await $.session.usage({ breakdown: 'summary' }).then(
-    usage => usage.context,
-    () => undefined,
-  )
-  const messages = context?.breakdown?.categories.find(c => c.kind === 'used' && c.name === 'Messages')
+  for (const breakdown of ['full', 'summary'] as const) {
+    const context = await $.session.usage({ breakdown }).then(
+      usage => usage.context,
+      () => undefined,
+    )
+    const row = context?.breakdown?.categories.find(c => c.kind === 'used' && c.name === 'Messages')
+    if (row !== undefined) return row.tokens
+    if (breakdown === 'summary') return context?.tokens
+  }
 
-  return messages?.tokens ?? context?.tokens
+  return undefined
 }
 
 // The conversation as the model reads it: it weighs each cut point, and
@@ -103,8 +108,7 @@ function viewOf(rows: readonly SessionMessage[], api: Awaited<ReturnType<typeof 
 
 const messages = (n: number): string => `${n} message${n === 1 ? '' : 's'}`
 
-// What /compact will do with the armed cut, said before anything happens:
-// what Claude Code summarizes and keeps, the last reply before the cut kept.
+// What /compact will do with the armed cut, said before anything happens.
 function confirmation(rows: readonly SessionMessage[], view: View, cut: Cut, asked?: number, tokens?: number): string {
   // Tokens split by share only where the shares are of what the model reads.
   const share = (percent: number): string =>
@@ -115,10 +119,7 @@ function confirmation(rows: readonly SessionMessage[], view: View, cut: Cut, ask
     ...(asked !== undefined && asked !== cut.percent
       ? [`You asked for ${asked}%; ${cut.percent}% is the nearest point that keeps tool calls whole.`]
       : []),
-    `Summarized: ${messages(cut.keep)} (${share(cut.percent)}). Kept verbatim: ${messages(rows.length - cut.keep)} (${share(100 - cut.percent)}).`,
-    ...(cut.keep < cut.index
-      ? [`Claude Code also keeps the last reply before the cut, so the kept part starts ${messages(cut.index - cut.keep)} earlier; the figures count that.`]
-      : []),
+    `Summarized: ${messages(cut.index)} (${share(cut.percent)}). Kept verbatim: ${messages(rows.length - cut.index)} (${share(100 - cut.percent)}).`,
     view.isWeighed
       ? `Shares are of what the model reads${tokens === undefined ? '' : `: ${thousands(tokens)} of conversation by Claude Code's count`}.`
       : 'Shares are of the visible messages alone: the conversation as the model reads it could not be matched to them.',
@@ -342,6 +343,11 @@ export const register: Register = (on, options) => {
     cutting = false
     if (e.agentId !== undefined) return next(e)
     reached = true
+    // Claude Code can compute an auto-compaction ahead of time and install it
+    // at the threshold without coming back here (behind a server flag of its
+    // own). With partial auto-compaction on, the mod declines that, so the
+    // compaction at the threshold comes through here as trigger auto.
+    if (e.trigger === 'precompute' && auto.isOn) return { skip: `${NAME} cuts each auto-compaction when it runs` }
     // An armed cut applies to the person's /compact; with auto mode on, every
     // auto-compaction gets the configured share.
     const manual = e.trigger === 'manual' ? armed : undefined
@@ -354,7 +360,7 @@ export const register: Register = (on, options) => {
     const at = pick(viewOf(e.messages, api, 'percent' in cut.want).cuts, cut.want)
     const aligned = api === undefined ? undefined : alignmentOf(e.messages, api)
     $.ui.log(
-      `cut at row ${at?.index ?? '-'} (kept from ${at?.keep ?? '-'}) of ${e.messages.length}, API message ${at === undefined ? '-' : (aligned?.places[at.keep] ?? '-')} of ${api?.length ?? '-'}, ${at?.percent ?? '-'}% summarized; ${api !== undefined && aligned !== undefined ? alignmentNote(e.messages, api, aligned) : 'no API form'}`,
+      `cut at row ${at?.index ?? '-'} of ${e.messages.length}, API message ${at === undefined ? '-' : (aligned?.places[at.index] ?? '-')} of ${api?.length ?? '-'}, ${at?.percent ?? '-'}% summarized; ${api !== undefined && aligned !== undefined ? alignmentNote(e.messages, api, aligned) : 'no API form'}`,
       { to: 'debug' },
     )
     const head = at === undefined ? [] : e.messages.slice(0, at.index)
@@ -373,7 +379,8 @@ export const register: Register = (on, options) => {
     const notes = [cut.notes, e.instructions].map(n => n?.trim()).filter(Boolean).join('\n')
     let done
     try {
-      done = await next({ ...e, messages: head, instructions: framing(at, notes || undefined) })
+      const closing = { role: 'assistant' as const, text: CLOSING, toolUses: [] }
+      done = await next({ ...e, messages: [...head, closing], instructions: framing(e.messages, at, notes || undefined) })
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
       cutting = false
@@ -387,14 +394,26 @@ export const register: Register = (on, options) => {
       return { skip: `${NAME}: not summarized: ${reason}` }
     }
     if (done.skip !== undefined) return done
+    // By its text: Claude Code stamps a handle on the message it kept.
+    const summary = done.messages.filter(m => !(m.role === 'assistant' && m.text.trim() === CLOSING))
 
+    // Claude Code keeps part of what it was handed to summarize: the rows it
+    // hands back beside its summary. Where verbatim text starts, and the share
+    // summarized, come from those, whatever path the compaction took.
+    const rowOf = new Map(e.messages.map((m, i) => [m.handle, i]))
+    const keptFrom =
+      summary.map(m => (m.handle === undefined ? undefined : rowOf.get(m.handle))).find(i => i !== undefined) ?? at.index
+    const summarized = shareBefore(e.messages, keptFrom, api === undefined ? undefined : weightsOf(e.messages, api))
     $.ui.log(
-      `${isAuto ? 'auto-compaction ' : ''}summarized everything before ${describe(at)}. That message and everything after it are kept verbatim.`,
+      `${isAuto ? 'auto-compaction ' : ''}summarized everything before ${describe({ ...at, percent: summarized })}. That message and everything after it are kept verbatim` +
+        (keptFrom < at.index
+          ? `, and so ${at.index - keptFrom === 1 ? 'is the message' : `are the ${at.index - keptFrom} messages`} before it, which Claude Code kept: verbatim text starts at "${previewAt(e.messages, keptFrom)}".`
+          : '.'),
     )
     $.clock.after(RELINK_MS[0] ?? 3000, () => void relink($, since))
 
     return {
-      messages: [...done.messages, ...e.messages.slice(at.index)],
+      messages: [...summary, ...e.messages.slice(at.index)],
       ...(done.usage !== undefined && { usage: done.usage }),
     }
   }).catch(($, e, next) => {

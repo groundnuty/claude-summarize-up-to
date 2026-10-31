@@ -26,7 +26,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORDS = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT", "GOLF", "HOTEL", "INDIA", "JULIETT", "KILO", "LIMA",
          "MIKE", "NOVEMBER", "OSCAR", "PAPA"]
 WORD_RE = re.compile(r"\b(" + "|".join(WORDS) + r")\b")
-MODEL = "claude-haiku-5-5"
+# The model the test sessions run; E2E_MODEL picks another, for one with a different window.
+MODEL = os.environ.get("E2E_MODEL", "claude-haiku-5-5")
 # The Claude Code binary under test; set CLAUDE_BIN where `claude` is not on PATH.
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 # Text that only a dialog shows. The driver never types while one is up.
@@ -39,12 +40,13 @@ class Abort(Exception):
 
 
 class Session:
-    """One interactive Claude Code in a detached tmux session."""
+    """One interactive Claude Code in a detached tmux session, always named
+    exactly ("=name"): tmux otherwise matches a prefix, another run's session."""
 
     def __init__(self, name, cwd, args, env, log):
         self.name, self.cwd, self.log = name, cwd, log
         self.projects = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd)))
-        tmux("kill-session", "-t", name)
+        tmux("kill-session", "-t", f"={name}")
         command = " ".join(["env"] + [f"{k}={v}" for k, v in env.items()] + [CLAUDE] + [quote(a) for a in args])
         tmux("new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", cwd, command)
         self.started = time.time()
@@ -52,7 +54,7 @@ class Session:
         while time.time() < deadline:
             pane = self.pane()
             if any(t in pane for t in TRUST):
-                tmux("send-keys", "-t", name, "Enter")  # a fresh scratch folder: trust it once
+                tmux("send-keys", "-t", f"={name}:", "Enter")  # a fresh scratch folder: trust it once
                 time.sleep(2)
                 continue
             if self.state()[0] == "idle":
@@ -61,7 +63,7 @@ class Session:
         raise Abort("Claude Code did not reach its prompt:\n" + self.pane())
 
     def pane(self):
-        return tmux("capture-pane", "-p", "-t", self.name)
+        return tmux("capture-pane", "-p", "-t", f"={self.name}:")
 
     def state(self):
         pane = self.pane()
@@ -91,13 +93,15 @@ class Session:
         (dropped by a hook) writes nothing to the transcript to wait for."""
         self.wait_idle(60)
         before = len(self.entries())
+        # The typed text first, the paste after it: a model took an instruction
+        # that followed a paste for part of the paste, and declined it.
+        tmux("send-keys", "-t", f"={self.name}:", "-l", text)
+        time.sleep(0.4)
         if paste is not None:
             tmux("load-buffer", "-b", "e2e", paste)
-            tmux("paste-buffer", "-p", "-b", "e2e", "-t", self.name)
-            time.sleep(1.5)
-        tmux("send-keys", "-t", self.name, "-l", text)
-        time.sleep(0.4)
-        tmux("send-keys", "-t", self.name, "Enter")
+            tmux("paste-buffer", "-p", "-b", "e2e", "-t", f"={self.name}:")
+            time.sleep(1.5 + os.path.getsize(paste) / 50000)
+        tmux("send-keys", "-t", f"={self.name}:", "Enter")
         self.log(f"> {text[:90]}")
         deadline = time.time() + (4 if quiet else timeout)
         while time.time() < deadline and (quiet or len(self.entries()) == before):
@@ -133,17 +137,17 @@ class Session:
     def exit(self):
         """Quit Claude Code with /exit, as a person would, and wait until it has."""
         self.wait_idle(60)
-        tmux("send-keys", "-t", self.name, "-l", "/exit")
+        tmux("send-keys", "-t", f"={self.name}:", "-l", "/exit")
         time.sleep(0.4)
-        tmux("send-keys", "-t", self.name, "Enter")
+        tmux("send-keys", "-t", f"={self.name}:", "Enter")
         self.log("> /exit")
         deadline = time.time() + 30
-        while time.time() < deadline and subprocess.run(["tmux", "has-session", "-t", self.name], capture_output=True).returncode == 0:
+        while time.time() < deadline and subprocess.run(["tmux", "has-session", "-t", f"={self.name}"], capture_output=True).returncode == 0:
             time.sleep(1)
         self.close()
 
     def close(self):
-        tmux("kill-session", "-t", self.name)
+        tmux("kill-session", "-t", f"={self.name}")
 
 
 def tmux(*args):
@@ -177,7 +181,13 @@ def live_context(entries):
 
 
 def first_sentence(text):
-    body = WORD_RE.sub("", text, count=1).strip(" \n:.,;!?-*")
+    body = WORD_RE.sub("", text, count=1).lstrip(" \n:.,;!?-*")
+    # A heading the model may open with ("**Athens, Greece**") is no sentence.
+    # Emphasis marks go: the model quotes the words, not the markdown.
+    lines = [re.sub(r"[*_]+", "", line).strip(" #") for line in body.split("\n") if re.sub(r"[*_]+", "", line).strip(" #")]
+    while len(lines) > 1 and len(lines[0]) < 80 and not re.search(r"[.!?]$", lines[0]):
+        lines.pop(0)
+    body = " ".join(lines)
     match = re.match(r"(.{20,}?[.!?])(\s|$)", body, re.S)
     return (match.group(1) if match else body[:80]).strip()
 
@@ -189,6 +199,17 @@ class Checks:
     def __call__(self, ok, label, detail=""):
         print(f"  {'PASS' if ok else 'FAIL'}  {label}" + (f"  ({detail})" if detail else ""), flush=True)
         self.failed += 0 if ok else 1
+
+
+def reported_start(debug):
+    """The code word where the mod says verbatim text starts, when Claude Code
+    kept messages before its cut; None when it starts at the cut."""
+    found = None
+    for line in open(debug, errors="replace"):
+        if "[summarize-up-to] $.ui.log:" in line and "summarized everything before" in line:
+            start = line.split('verbatim text starts at "', 1)
+            found = WORD_RE.search(start[1]) if len(start) == 2 else None
+    return found.group(1) if found else None
 
 
 def reported_cut(debug):
@@ -212,6 +233,7 @@ def verify(session, check, trigger, used_words, debug):
     cut = reported_cut(debug)
     check(cut is not None, "the mod reports its cut", f"before {cut}" if cut else "no report in the debug log")
     live = live_context(entries)
+    check(not any(CLOSING in text_of(e) for e in live), "the mod's closing message is not left in the conversation")
     summary = " ".join(text_of(e) for e in live if e.get("isCompactSummary"))
     replies = [e for e in live if e.get("type") == "assistant" and not e.get("isCompactSummary")]
     verbatim = []
@@ -224,10 +246,10 @@ def verify(session, check, trigger, used_words, debug):
     check(verbatim == used_words[len(used_words) - len(verbatim):], "the kept replies are exactly the newest ones, in order")
     check(len(verbatim) <= len(used_words) - 2, "at least two of the oldest replies are not kept verbatim")
     if cut in used_words and verbatim:
-        # Claude Code keeps the one reply just before a cut that opens on a prompt.
-        first = used_words.index(verbatim[0])
-        check(first in (used_words.index(cut), used_words.index(cut) - 1), "the kept part starts at the reported cut",
-              f"kept from {verbatim[0]}, cut before {cut}")
+        # Claude Code keeps some of what precedes the cut; the mod reports where
+        # verbatim text then starts.
+        expected = reported_start(debug) or cut
+        check(verbatim[0] == expected, "the kept part starts where the mod says", f"kept from {verbatim[0]}, the mod said {expected}")
     dropped = [w for w in used_words if w not in verbatim]
     check(any(w in summary for w in dropped), "the summary covers the older replies", f"{sum(w in summary for w in dropped)}/{len(dropped)} named")
 
@@ -245,9 +267,10 @@ def quotes(session, check, verbatim, dropped, sentences, after=""):
                  "full sentence that follows the code word, copied exactly. One per line, nothing else.", timeout=240)
     answer = text_of(next(e for e in reversed(session.entries()) if e.get("type") == "assistant"))
     quoted = {m.group(1): m.group(2).strip() for m in re.finditer(r"^\W*(" + "|".join(WORDS) + r")\W*:\s*(.+)$", answer, re.M)}
-    exact = [w for w in verbatim if w in sentences and sentences[w][:40] in quoted.get(w, "")]
+    # Case aside: a reply's sentence may open lower-case after its code word.
+    exact = [w for w in verbatim if w in sentences and sentences[w][:40].lower() in quoted.get(w, "").lower()]
     check(len(exact) >= max(1, len(verbatim) - 1), f"the model quotes the kept replies word for word{after}", f"{len(exact)}/{len(verbatim)} exact")
-    leaked = [w for w in dropped if w in sentences and len(sentences[w]) > 30 and sentences[w][:40] in answer]
+    leaked = [w for w in dropped if w in sentences and len(sentences[w]) > 30 and sentences[w][:40].lower() in answer.lower()]
     check(not leaked, f"the model cannot quote the summarized replies{after}", ", ".join(leaked) or "none")
 
 
@@ -289,6 +312,10 @@ def summarized_tokens(entries):
     summary = sum(len(text_of(e)) for e in entries[at + 1:] if e.get("isCompactSummary"))
     return before[-1] - after[0] + summary // 4 if before and after else None
 
+
+# The message the mod closes the summarizer's part with (hooks/cut.ts CLOSING);
+# it must never remain in the conversation.
+CLOSING = "The conversation goes on after your summary, verbatim from the next message."
 
 # Files mentioned in the first turns: the model reads them, the mod's rows do not.
 ATTACHED = (0, 2, 3)
@@ -357,7 +384,43 @@ def scenario_manual(session, check, log, debug):
     return kept
 
 
+# How Claude Code reached and ran a compaction, from its debug log.
+PATH_LINES = ("autocompact: routing", "precomputed compact:", "session.compact (", "autocompact: tokens=")
+
+
+def compaction_path(debug):
+    seen = []
+    for line in open(debug, errors="replace"):
+        text = line.split("] ", 1)[-1].strip()
+        if any(p in text for p in PATH_LINES) and "level=ok" not in text and "level=warn" not in text:
+            text = re.sub(r"\s+", " ", text)[:150]
+            if not seen or seen[-1] != text:
+                seen.append(text)
+    return seen
+
+
+def threshold_of(session):
+    """Claude Code's auto-compaction threshold in tokens, as /summarize-up-to status reports it."""
+    session.send("/summarize-up-to status")
+    flat = re.sub(r"\s+", " ", session.pane())
+    found = re.findall(r"auto-compacts at (\d+)k tokens \((\d+)% of (\d+)k\)", flat)
+    return (int(found[-1][0]) * 1000, found[-1]) if found else (None, None)
+
+
+def write_filler(path, tokens):
+    lines = max(50, int(tokens * 4 / 68))
+    with open(path, "w") as f:
+        f.writelines(f"{i:05d} filler line for the end-to-end test; nothing here to remember.\n" for i in range(lines))
+
+
 def scenario_auto(session, check, log, filler, debug):
+    threshold, shown = threshold_of(session)
+    log(f"auto-compaction threshold: {shown[0]}k tokens, {shown[1]}% of a {shown[2]}k window" if shown else "auto-compaction threshold: not shown")
+    check(threshold is not None, "Claude Code reports an auto-compaction threshold")
+    if threshold is None:
+        return None
+    # About ten turns to reach it, so a 65% cut has turns on both sides.
+    write_filler(filler, threshold / 10)
     used = []
     for word in WORDS:
         count = len(boundaries(session.entries()))
@@ -369,28 +432,38 @@ def scenario_auto(session, check, log, filler, debug):
             break
     else:
         check(False, "auto-compaction fired")
+        for line in compaction_path(debug):
+            log(f"path: {line}")
         return None
+    for line in compaction_path(debug):
+        log(f"path: {line}")
     return verify(session, check, "auto", used, debug)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("scenario", choices=["manual", "auto"])
+    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default"],
+                        help="auto: threshold from CLAUDE_CODE_AUTO_COMPACT_WINDOW; auto-setting: from the "
+                             "autoCompactWindow setting /autocompact writes; auto-default: Claude Code's own")
     parser.add_argument("--keep", action="store_true", help="leave the tmux session running afterwards")
+    parser.add_argument("--tag", default="", help="a suffix for the tmux session name, to run copies side by side")
     args = parser.parse_args()
 
     work = tempfile.mkdtemp(prefix=f"sut-e2e-{args.scenario}-", dir="/tmp")
     os.makedirs(os.path.join(work, ".claude"))
-    is_auto = args.scenario == "auto"
+    is_auto = args.scenario.startswith("auto")
     # The person's own settings stay out: project settings carry what the test needs.
+    settings = {"autoCompactEnabled": is_auto, "permissions": {"allow": ["Bash(echo:*)"]}}
+    if args.scenario == "auto-setting":
+        settings["autoCompactWindow"] = 100000
     with open(os.path.join(work, ".claude", "settings.json"), "w") as f:
-        json.dump({"autoCompactEnabled": is_auto, "permissions": {"allow": ["Bash(echo:*)"]}}, f)
+        json.dump(settings, f)
     options = {"auto_compact": is_auto, "summarize_percent": 65}
     flags = json.dumps({"pluginConfigs": {"summarize-up-to@inline": {"options": options}}})
     debug = os.path.join(work, "debug.txt")
     claude_args = ["--model", MODEL, "--permission-mode", "default", "--setting-sources", "project", "--settings", flags,
                    "--strict-mcp-config", "--tools", "Bash", "--plugin-dir", REPO, "--debug-file", debug]
-    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if is_auto else {}
+    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario == "auto" else {}
 
     def log(message):
         print(f"  ...   {message}", flush=True)
@@ -399,23 +472,21 @@ def main():
     check = Checks()
     session = None
     try:
-        session = Session(f"sut-e2e-{args.scenario}", work, claude_args, env, log)
+        name = (f"sut-e2e-{args.scenario}" + (f"-{MODEL.replace('claude-', '')}" if "E2E_MODEL" in os.environ else "")
+                + (f"-{args.tag}" if args.tag else ""))
+        session = Session(name, work, claude_args, env, log)
         for i in ATTACHED:
             with open(os.path.join(work, f"notes{i}.txt"), "w") as f:
                 f.writelines(f"note {i}.{n:04d}: a reference line the end-to-end test attaches; nothing to act on.\n" for n in range(200))
         if is_auto:
-            # About 4k tokens a turn: enough turns before the threshold for a 65% cut.
-            filler = os.path.join(work, "filler.txt")
-            with open(filler, "w") as f:
-                f.writelines(f"{i:05d} filler line for the end-to-end test; nothing here to remember.\n" for i in range(250))
-            kept = scenario_auto(session, check, log, filler, debug)
+            kept = scenario_auto(session, check, log, os.path.join(work, "filler.txt"), debug)
         else:
             kept = scenario_manual(session, check, log, debug)
         if kept is not None:
             # A restart: Claude Code rebuilds the conversation from the transcript.
             resumed = os.path.basename(session.transcript())[:-len(".jsonl")]
             session.exit()
-            session = Session(f"sut-e2e-{args.scenario}", work, claude_args + ["--resume", resumed], env, log)
+            session = Session(name, work, claude_args + ["--resume", resumed], env, log)
             log(f"resumed {resumed}")
             quotes(session, check, *kept, after=" after a restart and resume")
     except Abort as error:
