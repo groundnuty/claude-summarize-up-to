@@ -41,7 +41,7 @@ const ROWS: SessionMessage[] = [
 
 // The refusal itself needs Claude Code's security default seated, which the
 // test kit has no way to seat; here the probe is the only path.
-test('with no compaction yet, a settings read shows a cut can apply, and the cut goes ahead', async ($, on) => {
+test('with no compaction yet, a settings read shows a cut can apply, and the cut is armed', async ($, on) => {
   let reads = 0
   mock.clock(on)
   on('session.messages', () => ({ value: ROWS }))
@@ -55,7 +55,7 @@ test('with no compaction yet, a settings read shows a cut can apply, and the cut
   const listed = await $.command.run(typed(''))
 
   expect(reads).toBeGreaterThan(0)
-  expect(ran.text).toMatch(/^Summarizing everything before the peer message/)
+  expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the peer message/)
   expect(listed.text).toMatch(/Compaction reaches this mod in this session/)
 })
 
@@ -73,8 +73,7 @@ test('a cut summarizes only what comes before it and keeps the rest whole', asyn
   let seen: SessionCompactInput | undefined
 
   // Beneath the plugin these hooks stand for the engine; the last one for
-  // its summarizer, which answers one summary message. The mocked clock
-  // holds the command's own timer.
+  // its summarizer, which answers one summary message.
   mock.clock(on)
   on('session.messages', () => ({ value: ROWS }))
   on('session.compact', (_, e) => {
@@ -83,18 +82,38 @@ test('a cut summarizes only what comes before it and keeps the rest whole', asyn
     return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
   })
 
-  await warm($)
   const ran = await $.command.run(typed('#2 keep the API decisions'))
-  expect(ran.text).toMatch(/^Summarizing everything before the peer message at \d+% \("@critic: second result"\)/)
+  expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the peer message at \d+% \("@critic: second result"\)/)
 
-  // The compaction the command starts, as the engine raises it: over the
-  // whole transcript, each message carrying its handle.
-  const done = await $.session.compact({ trigger: 'plugin', messages: ROWS, instructions: 'keep the API decisions' })
+  // The person's /compact, as the engine raises it: over the whole
+  // transcript, each message carrying its handle, with notes of its own.
+  const done = await $.session.compact({ trigger: 'manual', messages: ROWS, instructions: 'mention the deadline' })
 
   expect(seen?.messages.map(m => m.handle)).toEqual(['h0', 'h1', 'h2', 'h3', 'h4', 'h5'])
   expect(seen?.instructions).toMatch(/starting with this message:\n"@critic: second result"/)
-  expect(seen?.instructions).toMatch(/Also: keep the API decisions/)
+  expect(seen?.instructions).toMatch(/Also: keep the API decisions\nmention the deadline/)
   expect(done.messages?.map(m => m.handle ?? m.text)).toEqual(['SUMMARY', 'h6', 'h7'])
+})
+
+test('arming starts nothing, and the cut ignores compactions it was not armed for', async ($, on) => {
+  const triggers: (string | undefined)[] = []
+  const clock = mock.clock(on)
+  on('session.messages', () => ({ value: ROWS }))
+  on('session.compact', (_, e) => {
+    triggers.push(e.trigger)
+
+    return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
+  })
+
+  await $.command.run(typed('#2'))
+  await clock.advance(30000)
+  expect(triggers).toEqual([])
+
+  // Another plugin's compaction passes through whole; the cut stays armed.
+  const other = await $.session.compact({ trigger: 'plugin', messages: ROWS })
+  expect(other.messages?.map(m => m.text)).toEqual(['SUMMARY'])
+  const status = await $.command.run(typed('cancel'))
+  expect(status.text).toMatch(/^Armed cut dropped/)
 })
 
 // One prompt, then the agent alone: six tool round-trips and a closing reply.
@@ -125,11 +144,12 @@ test('with no prompt to cut at, a percentage cuts between steps and keeps each t
   const listed = await $.command.run(typed(''))
   expect(listed.text).toMatch(/^No prompts or messages between turns/)
 
-  await warm($)
   const ran = await $.command.run(typed('50%'))
-  expect(ran.text).toMatch(/^Summarizing everything before the step at \d+% \("step \d"\)/)
+  expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the step at \d+% \("step \d"\)/)
+  expect(ran.text).toMatch(/Summarized: \d+ messages \(\d+%, (about \d+k|under 1k) tokens\)\. Kept verbatim: \d+ messages \(\d+%/)
+  expect(ran.text).toMatch(/Type \/compact to go ahead, or \/summarize-up-to cancel\.$/)
 
-  const done = await $.session.compact({ trigger: 'plugin', messages: SOLO })
+  const done = await $.session.compact({ trigger: 'manual', messages: SOLO })
   const head = seen?.messages ?? []
   const tail = (done.messages ?? []).slice(1)
 
@@ -193,44 +213,33 @@ test('a step never cuts inside a batch of parallel tool calls', async ($, on) =>
 
     return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
   })
-  await warm($)
   await $.command.run(typed('60%'))
-  await $.session.compact({ trigger: 'plugin', messages: BATCH })
+  await $.session.compact({ trigger: 'manual', messages: BATCH })
 
-  expect(seen?.messages.map(m => m.handle)).not.toEqual(['p0', 'p1', 'p2', 'p3', 'p4'])
+  // A cut happened, and not between p4 and p5, the two halves of one message.
+  expect(seen?.messages.length).toBeLessThan(BATCH.length)
   expect(seen?.messages.at(-1)?.handle).not.toBe('p4')
 })
 
-test('where the engine refuses the mod a compaction, the cut stays armed for /compact', async ($, on) => {
-  let seen: SessionCompactInput | undefined
+test('the person\'s /compact applies the armed cut and says so', async ($, on) => {
   const logs: string[] = []
-  const clock = mock.clock(on)
+  mock.clock(on)
   on('session.messages', () => ({ value: ROWS }))
   on('ui.log', (_, e) => {
     logs.push(e.text)
 
     return { value: undefined }
   })
-  on('session.compact', (_, e) => {
-    // A headless session: a plugin's own compaction is refused.
-    if (e.trigger !== 'manual' && e.trigger !== 'precompute') throw new Error('not available in a headless session')
-    seen = e
+  on('session.compact', () => ({ messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }))
 
-    return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
-  })
+  await $.command.run(typed('#2'))
+  const done = await $.session.compact({ trigger: 'manual', messages: ROWS })
 
-  await warm($)
-  await $.command.run(typed('#2 keep the API decisions'))
-  await clock.advance(200 + 3 * 2000 + 100)
-  expect(logs.at(-1)).toMatch(/The cut stays armed: run \/compact to apply it/)
-
-  // The person's /compact, with notes of its own.
-  const done = await $.session.compact({ trigger: 'manual', messages: ROWS, instructions: 'mention the deadline' })
-
-  expect(seen?.messages.map(m => m.handle)).toEqual(['h0', 'h1', 'h2', 'h3', 'h4', 'h5'])
-  expect(seen?.instructions).toMatch(/Also: keep the API decisions\nmention the deadline/)
   expect(done.messages?.map(m => m.handle ?? m.text)).toEqual(['SUMMARY', 'h6', 'h7'])
   expect(logs.at(-1)).toMatch(/^summarize-up-to: summarized everything before the peer message/)
+  // Used once: the next /compact is whole again.
+  const again = await $.session.compact({ trigger: 'manual', messages: ROWS })
+  expect(again.messages?.map(m => m.text)).toEqual(['SUMMARY'])
 })
 
 test('cancel drops an armed cut', async ($, on) => {

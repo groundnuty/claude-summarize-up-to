@@ -1,22 +1,17 @@
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
-import { continuationsOf, cutsOf, framing, liveRows, pick } from './cut'
+import { continuationsOf, cutsOf, framing, liveRows, pick, sizeOf } from './cut'
 import type { Cut, Want } from './cut'
 
 const NAME = 'summarize-up-to'
 const SHOWN = 50
-// The engine refuses a compaction from inside the command's own hook, so the
-// command starts it from a timer once the session is idle again.
-const START_MS = 200
-const RETRY_MS = 2000
-const RETRIES = 3
 
 const USAGE = [
   `/${NAME}            list the cut points: your prompts and the notifications between turns`,
-  `/${NAME} #12 [notes] summarize everything before cut 12; it and all after stay verbatim`,
-  `/${NAME} 70% [notes] cut at the step nearest 70%, inside a turn too: any message boundary that keeps tool calls whole`,
-  `/${NAME} cancel      drop a cut that is still armed for the next /compact`,
-  `/${NAME} status      partial auto-compaction, its share, and when Claude Code auto-compacts`,
+  `/${NAME} 70% [notes] arm a cut at the step nearest 70%, inside a turn too; then type /compact`,
+  `/${NAME} #12 [notes] arm a cut at listed point 12; then type /compact`,
+  `/${NAME} cancel      drop the armed cut`,
+  `/${NAME} status      the armed cut, partial auto-compaction, and when Claude Code auto-compacts`,
 ].join('\n')
 
 type Ask =
@@ -65,6 +60,29 @@ function listing(cuts: readonly Cut[]): string {
 const describe = (cut: Cut): string =>
   `${cut.kind === 'step' ? 'the step' : `the ${cut.kind} message`} at ${cut.percent}% ("${cut.preview}")`
 
+// About four characters to a token: enough to tell 20k from 200k.
+const tokens = (rows: readonly SessionMessage[]): string => {
+  const k = Math.round(rows.reduce((n, m) => n + sizeOf(m), 0) / 4000)
+
+  return k >= 1 ? `about ${k}k tokens` : 'under 1k tokens'
+}
+
+// What /compact will do with the armed cut, said before anything happens.
+function confirmation(rows: readonly SessionMessage[], cut: Cut, asked?: number): string {
+  const before = rows.slice(0, cut.index)
+  const after = rows.slice(cut.index)
+
+  return [
+    `Armed: /compact will summarize everything before ${describe(cut)}.`,
+    ...(asked !== undefined && asked !== cut.percent
+      ? [`You asked for ${asked}%; ${cut.percent}% is the nearest point that keeps tool calls whole.`]
+      : []),
+    `Summarized: ${before.length} messages (${cut.percent}%, ${tokens(before)}). Kept verbatim: ${after.length} messages (${100 - cut.percent}%, ${tokens(after)}).`,
+    'Claude Code may keep a message or two more before the cut.',
+    `Type /compact to go ahead, or /${NAME} cancel.`,
+  ].join('\n')
+}
+
 // Step cuts skip rows that continue a parallel batch; without the API form
 // they fall back to every assistant row after a user row.
 async function stepsOf($: EngineInterface, rows: readonly SessionMessage[]): Promise<Cut[]> {
@@ -75,20 +93,21 @@ async function stepsOf($: EngineInterface, rows: readonly SessionMessage[]): Pro
   }
 }
 
-// The cut the command armed, consumed by the next compaction this mod or the
-// person starts (`/compact`); a reload loses it.
-type Armed = { want: Want; notes: string }
+// The cut the command armed, applied by the person's next /compact. The mod
+// never starts a compaction itself: Claude Code does not run a mod's
+// session.compact hook on a compaction that mod started, so the cut would be
+// lost and the whole conversation summarized. A reload drops the armed cut.
+type Armed = { want: Want; notes: string; described: string }
 let armed: Armed | undefined
-let applied: Cut | undefined
 // Set while the compaction hook cuts, and until the next compaction, for its
 // catch handler.
 let cutting = false
 // Whether compaction reaches this mod. Claude Code's built-in security default
 // (cc-plugin-sec-default, seated in Team and Enterprise organizations and on
 // machines with managed settings) passes session.compact past user plugins,
-// and settings.read with it; a cut started there would summarize the whole
-// conversation. Seeing either event proves the default does not stand in the
-// way; the command probes with a settings read before it gives up.
+// and settings.read with it; a cut there would never apply. Seeing either
+// event proves the default does not stand in the way; the command probes with
+// a settings read before it gives up.
 let reached = false
 const reachedNow = (): boolean => reached
 
@@ -97,7 +116,7 @@ const DEFAULT_PERCENT = 65
 let auto = { isOn: false, percent: DEFAULT_PERCENT }
 
 const UNREACHED = [
-  "Not run: in this session Claude Code keeps compaction away from user mods, so a cut would summarize the whole conversation.",
+  'Not armed: in this session Claude Code keeps compaction away from user mods, so /compact would summarize the whole conversation.',
   "That is Claude Code's built-in security default (cc-plugin-sec-default), seated in Team and Enterprise organizations and on machines with managed settings.",
   'An administrator can seat the mod ahead of it with managed prependPlugins.',
 ].join('\n')
@@ -114,40 +133,6 @@ async function probe($: EngineInterface): Promise<boolean> {
   }
 
   return reachedNow()
-}
-// Read through calls: the compaction hook changes both while we await.
-const appliedCut = (): Cut | undefined => applied
-const armedCut = (): Armed | undefined => armed
-
-async function summarize($: EngineInterface, cut: Armed, tries = 0): Promise<void> {
-  if (armedCut() !== cut) return
-  applied = undefined
-  try {
-    const done = await $.session.compact({ instructions: cut.notes.trim() || undefined })
-    if (done.skip !== undefined) {
-      armed = undefined
-
-      return $.ui.log(`${NAME}: not summarized: ${done.skip}`)
-    }
-  } catch (error) {
-    // Most likely a turn started in the meantime: try again once it may be over.
-    if (tries < RETRIES) {
-      $.clock.after(RETRY_MS, () => void summarize($, cut, tries + 1))
-
-      return
-    }
-    // A headless session, for one, compacts only inside a /compact turn.
-    const reason = error instanceof Error ? error.message : String(error)
-
-    return $.ui.log(
-      `${NAME}: could not start the compaction (${reason}). The cut stays armed: run /compact to apply it, or /${NAME} cancel.`,
-    )
-  }
-
-  if (appliedCut() === undefined) {
-    armed = undefined
-    $.ui.log(`${NAME}: the compaction ran without this mod's cut, so it covered the whole conversation.`)
-  }
 }
 
 export const register: Register = (on, options) => {
@@ -166,8 +151,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: NAME,
-      description: 'Summarize up to any point, inside agent-driven turns too, keeping the rest verbatim',
-      argumentHint: '[#n | n% | cancel] [notes]',
+      description: 'Arm a cut at any point, inside agent-driven turns too; /compact then summarizes only what precedes it',
+      argumentHint: '[#n | n% | cancel | status] [notes]',
     })
 
     return next(e)
@@ -194,10 +179,10 @@ export const register: Register = (on, options) => {
 
       return {
         text: [
+          armed !== undefined ? `Armed: /compact will summarize everything before ${armed.described}.` : 'No cut is armed.',
           `Partial auto-compaction: ${auto.isOn ? `on, summarizing the oldest ${auto.percent}%` : 'off'} (/config: ${NAME} options).`,
           `${at}; the context is ${context?.percent ?? '?'}% full. Set the threshold with /autocompact, e.g. /autocompact 900k.`,
           (await probe($)) ? 'Compaction reaches this mod in this session.' : UNREACHED,
-          ...(armed !== undefined ? ['A cut is armed for the next /compact.'] : []),
         ].join('\n'),
       }
     }
@@ -218,29 +203,27 @@ export const register: Register = (on, options) => {
             : `No such cut point; there are ${cuts.length}.\n\n${listing(cuts)}`,
       }
 
-    const cut: Armed = {
+    armed = {
       want:
         ask.kind === 'percent'
           ? { percent: ask.percent }
           : { fromEnd: cuts.length - ask.ordinal + 1, preview: chosen.preview },
       notes: ask.notes,
+      described: describe(chosen),
     }
-    armed = cut
-    applied = undefined
-    $.clock.after(START_MS, () => void summarize($, cut))
 
-    return { text: `Summarizing everything before ${describe(chosen)}…` }
-  }).catch(() => ({ text: `${NAME} failed before summarizing anything.` }))
+    return { text: confirmation(rows, chosen, ask.kind === 'percent' ? ask.percent : undefined) }
+  }).catch(() => ({ text: `${NAME} failed; nothing was armed.` }))
 
   on('session.compact', async ($, e, next) => {
     cutting = false
     if (e.agentId !== undefined) return next(e)
     reached = true
-    // A cut the person armed applies to their /compact or the mod's own;
-    // with auto mode on, every auto-compaction gets the configured share.
-    const manual = e.trigger === 'plugin' || e.trigger === 'manual' ? armed : undefined
+    // An armed cut applies to the person's /compact; with auto mode on, every
+    // auto-compaction gets the configured share.
+    const manual = e.trigger === 'manual' ? armed : undefined
     const isAuto = manual === undefined && e.trigger === 'auto' && auto.isOn
-    const cut: Armed | undefined = manual ?? (isAuto ? { want: { percent: auto.percent }, notes: '' } : undefined)
+    const cut = manual ?? (isAuto ? { want: { percent: auto.percent } as Want, notes: '' } : undefined)
     if (cut === undefined) return next(e)
     if (manual !== undefined) armed = undefined
 
@@ -275,7 +258,6 @@ export const register: Register = (on, options) => {
     }
     if (done.skip !== undefined) return done
 
-    applied = at
     $.ui.log(
       `${NAME}: ${isAuto ? 'auto-compaction ' : ''}summarized everything before ${describe(at)}. That message and everything after it are kept verbatim.`,
     )

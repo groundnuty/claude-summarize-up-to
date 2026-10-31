@@ -24,17 +24,29 @@ Installed at user scope, the mod is active in every session you start afterwards
 
 ## Use
 
+A cut takes two steps: the command arms it and tells you what will happen, and your `/compact` carries it out.
+
+```
+❯ /summarize-up-to 70%
+  Armed: /compact will summarize everything before the step at 68% ("…").
+  You asked for 70%; 68% is the nearest point that keeps tool calls whole.
+  Summarized: 412 messages (68%, about 120k tokens). Kept verbatim: 236 messages (32%, about 56k tokens).
+  Claude Code may keep a message or two more before the cut.
+  Type /compact to go ahead, or /summarize-up-to cancel.
+❯ /compact
+```
+
 | Command | What it does |
 | --- | --- |
 | `/summarize-up-to` | Lists the cut points: your prompts and the notifications between turns |
-| `/summarize-up-to 70% [notes]` | Summarizes everything before the step nearest 70% of the conversation and keeps the rest verbatim. Steps fall between any two messages that don't separate a tool call from its result, so long agent-driven turns can be cut too |
-| `/summarize-up-to #12 [notes]` | The same at a listed cut point |
-| `/summarize-up-to status` | Shows partial auto-compaction, its share, and when Claude Code auto-compacts |
-| `/summarize-up-to cancel` | Drops a cut that is still waiting for `/compact` |
+| `/summarize-up-to 70% [notes]` | Arms a cut at the step nearest 70% of the conversation. Steps fall between any two messages that don't separate a tool call from its result, so long agent-driven turns can be cut too |
+| `/summarize-up-to #12 [notes]` | Arms a cut at a listed cut point |
+| `/summarize-up-to status` | Shows the armed cut, partial auto-compaction, and when Claude Code auto-compacts |
+| `/summarize-up-to cancel` | Drops the armed cut |
 
-Optional notes are passed to the summarizer, as with `/compact <notes>`.
+Optional notes are passed to the summarizer together with any you give `/compact <notes>`. The percentage is a target: the cut snaps to the nearest point that keeps tool calls whole, which can be some way off when single messages are large. The confirmation says where it landed. The token figures estimate the conversation's text alone, not the system prompt or tools.
 
-In a headless (`-p`) or SDK session, Claude Code doesn't let a mod start a compaction. The cut is armed instead, and your next `/compact` applies it.
+The mod never starts a compaction itself. Claude Code doesn't run a mod's compaction hook on a compaction that same mod started, so the cut would be lost and the whole conversation summarized.
 
 ### Partial auto-compaction
 
@@ -65,7 +77,7 @@ See [Manage mods for your organization](https://code.claude.com/docs/en/plugins/
 ## What to expect
 
 - Cut points come from what Claude Code shows mods. Messages from other sessions are hidden from mods, so neither they nor the first reply after them are cut points. The steps between tool calls in the turns they start are.
-- The engine may keep one more assistant reply before the cut than the mod reports.
+- Claude Code may keep a message or two before the cut in addition to what the mod hands back. The end-to-end tests saw one reply kept, and once a reply and a prompt.
 - If anything goes wrong mid-cut, the conversation is left as it was.
 
 ## Develop
@@ -73,7 +85,10 @@ See [Manage mods for your organization](https://code.claude.com/docs/en/plugins/
 ```
 claude plugin validate .
 claude plugin test .
+python3 e2e/run.py manual && python3 e2e/run.py auto
 ```
+
+The unit tests run the mod against Claude Code's test kit. The end-to-end tests drive a real, interactive Claude Code session in tmux and must pass before a release. See [e2e/README.md](e2e/README.md).
 
 Requires Claude Code 2.1.314 or later.
 
