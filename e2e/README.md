@@ -11,10 +11,15 @@ Each run starts a real, interactive Claude Code in a detached tmux session and a
 
 | Scenario | What it does | What must hold |
 | --- | --- | --- |
-| `manual` | 10 code-word turns, every third with two `echo` tool calls; `/summarize-up-to status`; `/summarize-up-to 60%`; a 15 s wait; `/compact` | The command only arms and confirms (summarized and kept counts), and nothing compacts until `/compact`. Then the compaction is `manual`, the mod reports its cut, the newest replies stay verbatim in order, the older ones are only in the summary, and the model quotes the kept replies exactly and none of the others |
-| `auto` | Turns with about 4k tokens of pasted filler each, until Claude Code auto-compacts on its own (auto-compact window 100k), with the mod's partial auto-compaction on at 65% | The compaction is `auto`, and everything listed for `manual` after `/compact` holds |
+| `manual` | 10 code-word turns, every third with two `echo` tool calls, three with an @-mentioned 4k-token file the mod's rows do not show; `/summarize-up-to status`; `  /summarize-up-to 60%` typed after spaces; a 15 s wait; ` /compact` typed after a space; Enter on what the box then holds | The leading-space command runs and empties the box. The confirmation gives counts, shares of what the model reads, and Claude Code's tokens, and nothing compacts. ` /compact` reaches neither the model nor compaction, and the box then holds `/compact`. Enter on it compacts (`manual`). The mod reports its cut. The newest replies stay verbatim in order, the older ones are only in the summary, and the model quotes the kept replies exactly and none of the others. The summarized tokens the confirmation gave are within 0.6–1.6× of what left the model's input |
+| `auto` | Turns with about 4k tokens of pasted filler each, until Claude Code auto-compacts on its own (auto-compact window 100k), with the mod's partial auto-compaction on at 65% | The compaction is `auto`, and everything listed for `manual` after the compaction holds |
+| both, then | `/exit`, and `claude --resume` of the same session in a fresh tmux session | The mod said it saved the cut for restarts. `tools/relink.py`, reading only, finds the transcript whole as saved. After the resume, the model again quotes exactly the kept replies and none of the summarized ones |
 
-Claude Code keeps a message or two before the cut in addition to what the mod hands back, so the checks accept a kept part that starts up to one reply earlier than the reported cut.
+Claude Code also keeps the last reply before the cut, so the checks accept a kept part that starts one reply earlier than the reported cut. The confirmation counts that reply, and the token check holds it to that.
+
+Claude Code 2.1.302 draws the held-back line for ` /compact` only once the box's command menu closes. There the check finds the line in the transcript log and says so ("in the transcript, not on screen yet").
+
+The mod edits the test session's transcript after each cut: only the stale parent ids that Claude Code writes, as described in the main README. The end-to-end runs exercise exactly that.
 
 ## Requirements
 

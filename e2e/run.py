@@ -86,7 +86,9 @@ class Session:
             time.sleep(1)
         raise Abort(f"not idle after {timeout}s:\n" + self.pane())
 
-    def send(self, text, paste=None, timeout=180):
+    def send(self, text, paste=None, timeout=180, quiet=False):
+        """Type a prompt and wait until the session is idle again. A quiet one
+        (dropped by a hook) writes nothing to the transcript to wait for."""
         self.wait_idle(60)
         before = len(self.entries())
         if paste is not None:
@@ -97,11 +99,20 @@ class Session:
         time.sleep(0.4)
         tmux("send-keys", "-t", self.name, "Enter")
         self.log(f"> {text[:90]}")
-        deadline = time.time() + timeout
-        while time.time() < deadline and len(self.entries()) == before:
+        deadline = time.time() + (4 if quiet else timeout)
+        while time.time() < deadline and (quiet or len(self.entries()) == before):
             time.sleep(1)
         time.sleep(2)
         self.wait_idle(timeout)
+
+    def box(self):
+        """What the prompt box holds: the lines between its two borders."""
+        lines = self.pane().splitlines()
+        borders = [i for i, line in enumerate(lines) if line.startswith("──")]
+        if len(borders) < 2:
+            return None
+        inside = " ".join(line.strip() for line in lines[borders[-2] + 1:borders[-1]])
+        return inside.lstrip("❯").strip()
 
     def transcript(self):
         files = [f for f in glob.glob(os.path.join(self.projects, "*.jsonl")) if os.path.getmtime(f) >= self.started - 5]
@@ -118,6 +129,18 @@ class Session:
             except ValueError:
                 pass
         return out
+
+    def exit(self):
+        """Quit Claude Code with /exit, as a person would, and wait until it has."""
+        self.wait_idle(60)
+        tmux("send-keys", "-t", self.name, "-l", "/exit")
+        time.sleep(0.4)
+        tmux("send-keys", "-t", self.name, "Enter")
+        self.log("> /exit")
+        deadline = time.time() + 30
+        while time.time() < deadline and subprocess.run(["tmux", "has-session", "-t", self.name], capture_output=True).returncode == 0:
+            time.sleep(1)
+        self.close()
 
     def close(self):
         tmux("kill-session", "-t", self.name)
@@ -154,7 +177,7 @@ def live_context(entries):
 
 
 def first_sentence(text):
-    body = WORD_RE.sub("", text, count=1).strip(" \n:.,-*")
+    body = WORD_RE.sub("", text, count=1).strip(" \n:.,;!?-*")
     match = re.match(r"(.{20,}?[.!?])(\s|$)", body, re.S)
     return (match.group(1) if match else body[:80]).strip()
 
@@ -172,7 +195,7 @@ def reported_cut(debug):
     """The code word of the message the mod said it cut at, from its log line."""
     found = None
     for line in open(debug, errors="replace"):
-        if "$.ui.log: summarize-up-to:" in line and "summarized everything before" in line:
+        if "[summarize-up-to] $.ui.log:" in line and "summarized everything before" in line:
             found = WORD_RE.search(line.split("summarized everything before", 1)[1])
     return found.group(1) if found else None
 
@@ -183,7 +206,7 @@ def verify(session, check, trigger, used_words, debug):
     check(bool(bs) and bs[-1].get("compactMetadata", {}).get("trigger") == trigger,
           f"the latest compaction has trigger {trigger}", str(bs[-1].get("compactMetadata", {}).get("trigger")) if bs else "none")
     if not bs:
-        return
+        return None
     md = bs[-1]["compactMetadata"]
     check(md.get("postTokens", 0) < md.get("preTokens", 0), "the compaction freed context", f"{md.get('preTokens')} -> {md.get('postTokens')} tokens")
     cut = reported_cut(debug)
@@ -208,23 +231,76 @@ def verify(session, check, trigger, used_words, debug):
     dropped = [w for w in used_words if w not in verbatim]
     check(any(w in summary for w in dropped), "the summary covers the older replies", f"{sum(w in summary for w in dropped)}/{len(dropped)} named")
 
-    # What the model sees: exact first sentences of the kept replies, and none of the dropped ones.
     sentences = {WORD_RE.match(text_of(e).lstrip(" *#")).group(1): first_sentence(text_of(e))
                  for e in entries if e.get("type") == "assistant" and WORD_RE.match(text_of(e).lstrip(" *#"))}
+    quotes(session, check, verbatim, dropped, sentences)
+    saved(session, check, debug)
+    return verbatim, dropped, sentences
+
+
+def quotes(session, check, verbatim, dropped, sentences, after=""):
+    """What the model sees: exact first sentences of the kept replies, and none of the dropped ones."""
     session.send("Answer without using tools. For every assistant reply that appears as a verbatim message in this "
                  "conversation (not one only described in a summary), write its code word, a colon, and the first "
                  "full sentence that follows the code word, copied exactly. One per line, nothing else.", timeout=240)
     answer = text_of(next(e for e in reversed(session.entries()) if e.get("type") == "assistant"))
     quoted = {m.group(1): m.group(2).strip() for m in re.finditer(r"^\W*(" + "|".join(WORDS) + r")\W*:\s*(.+)$", answer, re.M)}
     exact = [w for w in verbatim if w in sentences and sentences[w][:40] in quoted.get(w, "")]
-    check(len(exact) >= max(1, len(verbatim) - 1), "the model quotes the kept replies word for word", f"{len(exact)}/{len(verbatim)} exact")
+    check(len(exact) >= max(1, len(verbatim) - 1), f"the model quotes the kept replies word for word{after}", f"{len(exact)}/{len(verbatim)} exact")
     leaked = [w for w in dropped if w in sentences and len(sentences[w]) > 30 and sentences[w][:40] in answer]
-    check(not leaked, "the model cannot quote the summarized replies", ", ".join(leaked) or "none")
+    check(not leaked, f"the model cannot quote the summarized replies{after}", ", ".join(leaked) or "none")
+
+
+def saved(session, check, debug):
+    """The mod saved the cut so that a resume keeps it: it says so, and the
+    repair tool, reading only, finds the transcript whole as it stands."""
+    deadline = time.time() + 60
+    said = None
+    while time.time() < deadline and said is None:
+        for line in open(debug, errors="replace"):
+            if "[summarize-up-to] $.ui.log:" in line and ("saved the cut" in line or "could not save the cut" in line):
+                said = line.split("$.ui.log: ", 1)[1].strip()
+        time.sleep(2)
+    check(said is not None and "saved the cut so that a restart or resume keeps it" in said and "could not save" not in said,
+          "the mod saved the cut so that a restart or resume keeps it", (said or "no report")[:140])
+    run = subprocess.run([sys.executable, "-I", os.path.join(REPO, "tools", "relink.py"), session.transcript()],
+                         capture_output=True, text=True)
+    as_is = next((line for line in run.stdout.splitlines() if line.startswith("as it is:")), run.stderr.strip())
+    whole = re.search(r"a resume reaches the latest summary; (\d+) of the (\d+) messages", as_is)
+    check(whole is not None and whole.group(1) == whole.group(2), "the transcript as saved resumes whole", as_is[:140])
+
+
+def real_input(entry):
+    usage = (entry.get("message") or {}).get("usage") or {}
+    return sum(usage.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+
+
+def summarized_tokens(entries):
+    """What the latest compaction took out of the model's input: its input just
+    before, less its input just after, plus the summary that replaced it."""
+    found = [i for i, e in enumerate(entries) if e.get("type") == "system" and e.get("subtype") == "compact_boundary"]
+    if not found:
+        return None
+    at = found[-1]
+    answered = [(i, real_input(e)) for i, e in enumerate(entries)
+                if e.get("type") == "assistant" and real_input(e) > 0 and (e.get("message") or {}).get("model") != "<synthetic>"]
+    before = [n for i, n in answered if i < at]
+    after = [n for i, n in answered if i > at]
+    summary = sum(len(text_of(e)) for e in entries[at + 1:] if e.get("isCompactSummary"))
+    return before[-1] - after[0] + summary // 4 if before and after else None
+
+
+# Files mentioned in the first turns: the model reads them, the mod's rows do not.
+ATTACHED = (0, 2, 3)
 
 
 def turns_manual(session, words):
     for i, word in enumerate(words):
-        if i % 3 == 1:
+        if i in ATTACHED:
+            session.send(f"Start your reply with the code word {word}, then describe in about 120 words a place whose "
+                         f"name starts with the letter {word[0]}. Here is @notes{i}.txt for later; it is attached "
+                         f"already, so leave it be and use no tool.")
+        elif i % 3 == 1:
             session.send(f"Use the Bash tool to run exactly `echo {word}-1`, then exactly `echo {word}-2`, as two "
                          f"separate calls. Then reply, starting with the code word {word}, in two sentences about a "
                          f"river whose name starts with {word[0]}.")
@@ -236,34 +312,65 @@ def turns_manual(session, words):
 def scenario_manual(session, check, log, debug):
     words = WORDS[:10]
     turns_manual(session, words)
+    entries = session.entries()
+    check(sum(e.get("type") == "attachment" and (e.get("attachment") or {}).get("type") == "file" for e in entries) >= len(ATTACHED),
+          "the mentioned files reached the model as attachments")
     session.send("/summarize-up-to status")
     pane = session.pane()
     check("Compaction reaches this mod in this session" in pane, "status: compaction reaches the mod")
-    session.send("/summarize-up-to 60%")
-    pane = session.pane()
-    check("Armed: /compact will summarize everything before" in pane, "the command arms a cut")
-    check("Summarized:" in pane and "Kept verbatim:" in pane, "the confirmation says how much is summarized and kept")
+
+    # Typed after a space, a slash command is text. The mod runs its own
+    # command and empties the box; it holds /compact back and offers it in the
+    # box without the space, so Enter alone compacts.
+    replies = sum(e.get("type") == "assistant" for e in session.entries())
     count = len(boundaries(session.entries()))
+    session.send("  /summarize-up-to 60%", quiet=True)
+    pane = session.pane()
+    check("Armed: /compact will summarize everything before" in pane, "'  /summarize-up-to 60%' arms a cut")
+    check(session.box() == "", "the box is empty afterwards", repr(session.box()))
+    flat = re.sub(r"\s+", " ", pane)
+    numbers = re.search(r"Summarized: \d+ messages \(\d+%, (?:about (\d+)k|under 1k) tokens\)\. Kept verbatim: \d+ messages", flat)
+    check(numbers is not None and "Shares are of what the model reads" in flat,
+          "the confirmation weighs the cut by what the model reads, in Claude Code's tokens")
     time.sleep(15)
     check(len(boundaries(session.entries())) == count, "arming alone starts no compaction (the 0.2.1 bug)")
-    session.send("/compact", timeout=300)
-    verify(session, check, "manual", words, debug)
+    session.send(" /compact", quiet=True)
+    pane = session.pane()
+    reason = "with a space before the slash it would have gone to the model as text"
+    shown = reason in re.sub(r"\s+", " ", pane)
+    # Claude Code 2.1.302 draws the line only once the box's command menu closes.
+    logged = any("[summarize-up-to] $.ui.log:" in line and reason in line for line in open(debug, errors="replace"))
+    check(shown or logged, "' /compact' is held back with a reason",
+          "on screen" if shown else "in the transcript, not on screen yet" if logged else "nowhere")
+    time.sleep(5)
+    entries = session.entries()
+    check(sum(e.get("type") == "assistant" for e in entries) == replies and len(boundaries(entries)) == count,
+          "' /compact' reached neither the model nor compaction")
+    check(session.box() == "/compact", "the box now holds /compact without the space", repr(session.box()))
+    session.send("", timeout=300)
+    kept = verify(session, check, "manual", words, debug)
+
+    estimate = int(numbers.group(1)) * 1000 if numbers is not None and numbers.group(1) else None
+    real = summarized_tokens(session.entries())
+    check(estimate is not None and real is not None and 0.6 <= estimate / max(real, 1) <= 1.6,
+          "the confirmation's summarized tokens match what left the model's input", f"said {estimate}, measured {real}")
+    return kept
 
 
 def scenario_auto(session, check, log, filler, debug):
     used = []
     for word in WORDS:
         count = len(boundaries(session.entries()))
-        session.send(f"Ignore the pasted filler. Start your reply with the code word {word}, then write two "
-                     f"sentences about a city whose name starts with {word[0]}.", paste=filler, timeout=300)
+        session.send(f"Code word {word}. Ignore the pasted filler; start your reply with the code word, then write "
+                     f"two sentences about a city whose name starts with {word[0]}.", paste=filler, timeout=300)
         used.append(word)
         if len(boundaries(session.entries())) > count:
             log(f"auto-compaction after {len(used)} turns")
             break
     else:
         check(False, "auto-compaction fired")
-        return
-    verify(session, check, "auto", used, debug)
+        return None
+    return verify(session, check, "auto", used, debug)
 
 
 def main():
@@ -293,14 +400,24 @@ def main():
     session = None
     try:
         session = Session(f"sut-e2e-{args.scenario}", work, claude_args, env, log)
+        for i in ATTACHED:
+            with open(os.path.join(work, f"notes{i}.txt"), "w") as f:
+                f.writelines(f"note {i}.{n:04d}: a reference line the end-to-end test attaches; nothing to act on.\n" for n in range(200))
         if is_auto:
             # About 4k tokens a turn: enough turns before the threshold for a 65% cut.
             filler = os.path.join(work, "filler.txt")
             with open(filler, "w") as f:
                 f.writelines(f"{i:05d} filler line for the end-to-end test; nothing here to remember.\n" for i in range(250))
-            scenario_auto(session, check, log, filler, debug)
+            kept = scenario_auto(session, check, log, filler, debug)
         else:
-            scenario_manual(session, check, log, debug)
+            kept = scenario_manual(session, check, log, debug)
+        if kept is not None:
+            # A restart: Claude Code rebuilds the conversation from the transcript.
+            resumed = os.path.basename(session.transcript())[:-len(".jsonl")]
+            session.exit()
+            session = Session(f"sut-e2e-{args.scenario}", work, claude_args + ["--resume", resumed], env, log)
+            log(f"resumed {resumed}")
+            quotes(session, check, *kept, after=" after a restart and resume")
     except Abort as error:
         check(False, "the run finished", str(error)[:2000])
     finally:
