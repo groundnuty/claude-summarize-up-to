@@ -1,0 +1,12 @@
+{
+  "name": "groundnuty",
+  "owner": { "name": "groundnuty" },
+  "description": "Claude Code mods by groundnuty",
+  "plugins": [
+    {
+      "name": "summarize-up-to",
+      "source": "./",
+      "description": "Summarize a Claude Code conversation up to any message, keeping the rest verbatim; optionally make auto-compaction do the same"
+    }
+  ]
+}

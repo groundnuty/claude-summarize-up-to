@@ -1,0 +1,25 @@
+{
+  "name": "summarize-up-to",
+  "version": "0.2.0",
+  "description": "Summarize the conversation up to any point, inside long agent-driven turns too, keeping everything after it verbatim; optionally make auto-compaction do the same",
+  "author": { "name": "groundnuty" },
+  "license": "MIT",
+  "homepage": "https://github.com/groundnuty/claude-summarize-up-to",
+  "repository": "https://github.com/groundnuty/claude-summarize-up-to",
+  "userConfig": {
+    "auto_compact": {
+      "type": "boolean",
+      "title": "Partial auto-compaction",
+      "description": "When Claude Code auto-compacts, summarize only the oldest share of the conversation and keep the rest verbatim. Set when it fires with /autocompact or CLAUDE_AUTOCOMPACT_PCT_OVERRIDE.",
+      "default": false
+    },
+    "summarize_percent": {
+      "type": "number",
+      "title": "Share to summarize (%)",
+      "description": "How much of the oldest conversation an auto-compaction summarizes; the rest stays verbatim.",
+      "default": 65,
+      "min": 10,
+      "max": 95
+    }
+  }
+}
