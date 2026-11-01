@@ -287,7 +287,10 @@ def quotes(session, check, verbatim, dropped, sentences, after=""):
     session.send("Answer without using tools. For every assistant reply that appears as a verbatim message in this "
                  "conversation (not one only described in a summary), write its code word, a colon, and the first "
                  "full sentence that follows the code word, copied exactly. One per line, nothing else.", timeout=240)
-    answer = text_of(next(e for e in reversed(session.entries()) if e.get("type") == "assistant"))
+    # Every assistant entry after the question: Claude Code may split one answer.
+    entries = session.entries()
+    asked = max(i for i, e in enumerate(entries) if e.get("type") == "user" and "Answer without using tools" in text_of(e))
+    answer = "\n".join(text_of(e) for e in entries[asked + 1:] if e.get("type") == "assistant")
     quoted = {m.group(1): m.group(2).strip() for m in re.finditer(r"^\W*(" + "|".join(WORDS) + r")\W*:\s*(.+)$", answer, re.M)}
     # Case aside: a reply's sentence may open lower-case after its code word.
     exact = [w for w in verbatim if w in sentences and sentences[w][:40].lower() in quoted.get(w, "").lower()]
@@ -540,28 +543,40 @@ def ui_logged(debug, text):
     return any("[summarize-up-to] $.ui.log" in line and text in line for line in open(debug, errors="replace"))
 
 
-def scenario_guarded(session, check, log, debug):
+def scenario_guarded(session, check, log, debug, work):
     """Claude Code's security default seated, as for Team and Enterprise logins
-    (a test policy, seen by this session alone): compaction cannot reach the
-    mod, so it warns at once and holds back a typed /compact, which would
-    summarize everything; /compact full goes through."""
+    (a test policy, seen by this session alone), with auto-compaction on: the
+    mod cannot cut, so it switches compaction off for the session and says so.
+    Past the threshold nothing compacts, and no /compact runs, full or not."""
     seated = any("sec-default@builtin seated" in line for line in open(debug, errors="replace"))
     check(seated, "Claude Code's security default is seated (a test policy, in this session alone)")
-    time.sleep(6)
+    deadline = time.time() + 30
+    while time.time() < deadline and not ui_logged(debug, "has switched compaction off in this session"):
+        time.sleep(2)
     check(ui_logged(debug, "Not cutting: in this session Claude Code keeps compaction away"), "the mod warns at once that it cannot cut here")
-    for word in WORDS[:3]:
-        session.send(f"Start your reply with the code word {word}, then write two sentences about a city whose name "
-                     f"starts with {word[0]}.")
+    check(ui_logged(debug, "has switched compaction off in this session"), "and switches compaction off for this session")
+    check(ui_logged(debug, "start the session with DISABLE_COMPACT=0"), "and says how to compact there anyway")
     session.send("/summarize-up-to status")
-    check("Not cutting:" in re.sub(r"\s+", " ", session.pane()), "the status leads with that warning")
+    flat = re.sub(r"\s+", " ", session.pane())
+    check("Not cutting:" in flat, "the status leads with that warning")
+    check("auto-compaction is off" in flat, "Claude Code reports auto-compaction off, though the settings turn it on")
+
+    # Past the threshold at which the auto scenario sees Claude Code compact.
+    filler = os.path.join(work, "filler.txt")
+    write_filler(filler, 8500)
+    for word in WORDS:
+        session.send(f"Code word {word}. Ignore the pasted filler; start your reply with the code word, then write "
+                     f"two sentences about a city whose name starts with {word[0]}.", paste=filler, timeout=300)
+        if last_input(session.entries()) > 70000 or boundaries(session.entries()):
+            break
+    peak = last_input(session.entries())
+    check(peak > 67000 and not boundaries(session.entries()), "past the auto-compaction threshold, nothing compacts",
+          f"input {peak} tokens, {len(boundaries(session.entries()))} compactions")
 
     count = len(boundaries(session.entries()))
     session.send("/compact", quiet=True)
     time.sleep(5)
-    check(len(boundaries(session.entries())) == count, "a typed /compact is held back: no compaction")
-    said = [text_of(e) or str(e.get("content", "")) for e in session.entries() if e.get("type") == "system"]
-    check(any("held back /compact: in this session Claude Code keeps compaction away" in t for t in said),
-          "it says why, and how to cut or to summarize everything")
+    check(len(boundaries(session.entries())) == count, "a typed /compact does not run: no compaction")
     check(session.box() == "", "the box is empty afterwards", repr(session.box()))
 
     session.send(" /compact", quiet=True)
@@ -571,10 +586,9 @@ def scenario_guarded(session, check, log, debug):
     time.sleep(5)
     check(len(boundaries(session.entries())) == count, "sent as /compact, it is held back too: no compaction")
 
-    session.send("/compact full", timeout=300)
-    entries = session.entries()
-    check(len(boundaries(entries)) == count + 1 and not kept_replies(entries), "/compact full summarizes everything",
-          f"{len(kept_replies(entries))} replies kept")
+    session.send("/compact full", quiet=True)
+    time.sleep(5)
+    check(len(boundaries(session.entries())) == count, "/compact full does not run either: nothing compacts here")
     return None
 
 
@@ -617,7 +631,7 @@ def main():
 
     work = tempfile.mkdtemp(prefix=f"sut-e2e-{args.scenario}-", dir="/tmp")
     os.makedirs(os.path.join(work, ".claude"))
-    is_auto = args.scenario.startswith("auto")
+    is_auto = args.scenario.startswith("auto") or args.scenario == "guarded"
     # The person's own settings stay out: project settings carry what the test needs.
     settings = {"autoCompactEnabled": is_auto, "permissions": {"allow": ["Bash(echo:*)", "Bash(cat:*)"]}}
     if args.scenario == "auto-setting":
@@ -629,7 +643,7 @@ def main():
     debug = os.path.join(work, "debug.txt")
     claude_args = ["--model", MODEL, "--permission-mode", "default", "--setting-sources", "project", "--settings", flags,
                    "--strict-mcp-config", "--tools", "Bash", "--plugin-dir", REPO, "--debug-file", debug]
-    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario in ("auto", "auto-midturn") else {}
+    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario in ("auto", "auto-midturn", "guarded") else {}
     wrap = ()
     if args.scenario == "guarded":
         # A policy with one inert setting, at /etc/claude-code for this session alone.
@@ -655,10 +669,10 @@ def main():
             with open(os.path.join(work, f"notes{i}.txt"), "w") as f:
                 f.writelines(f"note {i}.{n:04d}: a reference line the end-to-end test attaches; nothing to act on.\n" for n in range(200))
         if args.scenario == "guarded":
-            kept = scenario_guarded(session, check, log, debug)
+            kept = scenario_guarded(session, check, log, debug, work)
         elif args.scenario == "auto-midturn":
             kept = scenario_midturn(session, check, log, os.path.join(work, "filler.txt"), debug, work)
-        elif is_auto:
+        elif args.scenario.startswith("auto"):
             kept = scenario_auto(session, check, log, os.path.join(work, "filler.txt"), debug)
         else:
             kept = scenario_manual(session, check, log, debug)

@@ -93,15 +93,15 @@ Claude Code can also compute an auto-compaction ahead of time and install it at 
 
 ## Team and Enterprise organizations
 
-For Team and Enterprise logins, and on machines with managed settings, Claude Code loads a built-in guard (`cc-plugin-sec-default`). The guard keeps compaction away from mods a user installs, so any compaction there would summarize the whole conversation. Once seated, it holds until the session ends. Switching to a personal login or reloading plugins does not remove it; only a restart under a personal login on a machine without managed settings does.
+For Team and Enterprise logins, and on machines with managed settings, Claude Code loads a built-in guard (`cc-plugin-sec-default`). The guard keeps compaction away from mods a user installs, so any compaction there would summarize the whole conversation. The guard is decided when a session starts or reloads its plugins, and once seated it holds until the session ends. So an account switcher that moves a machine to a Team login affects the next start or reload, and switching back does not undo a seat; only a restart under a personal login on a machine without managed settings does.
 
-Where the guard stands in the mod's way, the mod says so and protects a typed `/compact`:
+Where the guard stands in the mod's way, no compaction runs on its own:
 
-- **When it loads,** including after `/reload-plugins` or a resume, it writes "Not cutting: …" into the conversation.
-- **`/summarize-up-to status`** leads with that warning.
-- **A typed `/compact` is held back**, with the reason and the restart command for this session. Claude Code runs `/compact` through `command.run`, which the guard does not keep from user mods.
-- **`/compact full`** goes through and summarizes everything.
-- **Auto-compaction cannot be held back:** with auto-compaction on, it summarizes everything there.
+- **Compaction is switched off.** When the mod loads into such a session (including after `/reload-plugins` or a resume), it sets `DISABLE_COMPACT=1` for that Claude Code process alone. No auto-compaction runs, whatever the settings say, and `/compact` becomes an unknown command. At the context limit the agent stops ("Context limit reached") instead of losing its context. Claude Code lets a mod switch compaction off but not back on, so it stays off until the session restarts.
+- **It says so.** It writes "Not cutting: …" into the conversation, and `/summarize-up-to status` leads with the same warning.
+- **The way out.** To compact in such a session anyway, start it with `DISABLE_COMPACT=0` in its environment. The mod leaves a value you set alone, and a compaction then summarizes everything.
+- **Child processes inherit it.** Claude Code processes the session starts, such as teammates in an agent team, inherit `DISABLE_COMPACT=1`, so they don't compact either.
+- **Where the switch is refused,** the mod still holds back a typed `/compact` with the reason and the restart command (`/compact full` goes through), but an auto-compaction would then summarize everything.
 
 An administrator can let the mod run by installing it as an organization mod, with the guard kept for every other mod. That means placing a clone of this repository at an admin-only path on each machine and setting:
 

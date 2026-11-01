@@ -201,11 +201,32 @@ const DEFAULT_PERCENT = 65
 let auto = { isOn: false, percent: DEFAULT_PERCENT }
 
 const UNREACHED = [
-  'Not cutting: in this session Claude Code keeps compaction away from user mods, so a compaction here summarizes the whole conversation.',
-  `A /compact you type is held back; /compact full summarizes everything. An auto-compaction cannot be held back: it summarizes everything.`,
+  'Not cutting: in this session Claude Code keeps compaction away from user mods, so a compaction here would summarize the whole conversation.',
   "That is Claude Code's built-in security default (cc-plugin-sec-default), seated in Team and Enterprise organizations and on machines with managed settings, and once seated it holds until the session ends.",
   'Restart the session under a personal login on a machine without managed settings (/exit, then claude --resume <id>), or have an administrator seat the mod ahead of it with managed prependPlugins.',
 ].join('\n')
+
+// Where the mod cannot cut, no compaction should run on its own: Claude Code's
+// would summarize everything, typed or automatic. DISABLE_COMPACT, which it
+// reads at each check, switches compaction off for this process alone. Claude
+// Code lets a mod switch it off but not on again ("only the environment Claude
+// Code starts with, or Claude Code itself, may give it this value"), so it
+// stays off until the session ends; a person who wants compaction there anyway
+// starts it with DISABLE_COMPACT=0, which the mod leaves alone.
+const OFF = 'DISABLE_COMPACT'
+let isSwitchedOff = false
+
+async function switchOff($: EngineInterface): Promise<boolean> {
+  if (isSwitchedOff) return true
+  if ((await $.env.get('DISABLE_COMPACT').catch(() => undefined)) !== undefined) return false
+  const done = await $.env.set('DISABLE_COMPACT', '1').catch(() => ({ deny: 'failed' }))
+  isSwitchedOff = done.deny === undefined
+
+  return isSwitchedOff
+}
+
+const SWITCHED_OFF = `So the mod has switched compaction off in this session (${OFF}=1, which nothing but a restart undoes): no auto-compaction runs here, /compact is an unknown command, and at the context limit the agent stops rather than lose its context. To compact here anyway, start the session with ${OFF}=0 in its environment; the mod then leaves compaction alone, and a compaction summarizes everything.`
+const NOT_SWITCHED_OFF = `The mod could not switch compaction off here: a /compact you type is held back, but an auto-compaction would summarize everything.`
 
 // What a held-back /compact says, with the way to cut and the way not to.
 async function heldBack($: EngineInterface): Promise<string> {
@@ -317,7 +338,7 @@ async function answer($: EngineInterface, args: string): Promise<string> {
     const isReached = await probe($)
 
     return [
-      ...(isReached ? [] : [UNREACHED, '']),
+      ...(isReached ? [] : [UNREACHED, (await switchOff($)) ? SWITCHED_OFF : NOT_SWITCHED_OFF, '']),
       shareLine(await standingShare($)),
       ...(armed !== undefined ? [`Armed for the next /compact only: everything before ${armed.described}.`] : []),
       `Partial auto-compaction: ${auto.isOn ? `on, summarizing the oldest ${auto.percent}%` : 'off'} (/config: ${NAME} options).`,
@@ -388,12 +409,13 @@ export const register: Register = (on, options) => {
       argumentHint: '[n% | #n | cancel | status] [notes]',
     })
     // A start, a resume or a reload under Claude Code's security default:
-    // said at once, before anyone compacts. Once the session has settled.
+    // compaction is switched off and that said at once, before anything
+    // compacts. Once the session has settled.
     $.clock.after(STARTUP_MS, () => {
-      void probe($).then(
-        isReached => (isReached ? undefined : $.ui.log(UNREACHED)),
-        () => undefined,
-      )
+      void (async () => {
+        if (await probe($)) return
+        $.ui.log(`${UNREACHED}\n${(await switchOff($)) ? SWITCHED_OFF : NOT_SWITCHED_OFF}`)
+      })().catch(() => undefined)
     })
 
     return next(e)
@@ -403,13 +425,13 @@ export const register: Register = (on, options) => {
   // /compact would summarize everything. Commands reach the mod through
   // command.run, which the default does not pass over: /compact is held back
   // there, so a forgotten guard cannot cost a curated context. "/compact full"
-  // runs, as a plain one where the mod cannot cut.
+  // runs, as a plain one. Where the mod has switched compaction off, Claude
+  // Code itself makes /compact an unknown command, and this never runs.
   on('command.run', { command: 'compact' }, async ($, e, next) => {
-    const isFull = /^full$/i.test(e.args.trim())
     if (await probe($)) return next(e)
-    if (isFull) return next({ ...e, args: '' })
+    if (!/^full$/i.test(e.args.trim())) return { text: await heldBack($) }
 
-    return { text: await heldBack($) }
+    return next({ ...e, args: '' })
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: NAME }, async ($, e) => ({ text: await answer($, e.args) })).catch(() => ({
