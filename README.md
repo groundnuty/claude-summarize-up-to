@@ -113,6 +113,8 @@ bash tools/machine-policy.sh remove
 
 Its limit is the organization's. Managed sources are "first-wins": under a login whose organization delivers server-managed settings, even one key, Claude Code ignores the machine file, and a lower source can't opt into merging with the one above it. So the tool also installs the mod in each project you name, as a fallback: under such a login that install loads behind the guard and switches compaction off. The agent then stops at the context limit instead of compacting everything. To cut under that login, its organization has to seat the mod. Keep it out of an account switcher's rotation if it can't.
 
+Restart running sessions after installing the policy. Where the policy applies, the current Claude Code loads only the machine's copy, and a reload stays clean (tested on 2.1.316). A `/reload-plugins` in a process still on 2.1.302 loaded both copies, and the one behind the guard switched compaction off until a restart.
+
 An organization's administrator can let the mod run by installing it as an organization mod, with the guard kept for every other mod. That means placing a clone of this repository at an admin-only path on each machine and setting:
 
 ```json

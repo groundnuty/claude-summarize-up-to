@@ -115,7 +115,10 @@ for run in 1 2; do
 done
 state=failed
 if grep -q "hooks module summarize-up-to@machine-mods loaded (worker.*tier prepend)" "$CHECK/debug2.txt" \
-  && grep -q "Compaction reaches this mod in this session" "$CHECK/out2.txt"; then
+  && grep -q "hooks module summarize-up-to@groundnuty not loaded" "$CHECK/debug2.txt" \
+  && ! grep -q "hooks module summarize-up-to@groundnuty loaded" "$CHECK/debug2.txt" \
+  && grep -q "Compaction reaches this mod in this session" "$CHECK/out2.txt" \
+  && ! grep -q "Compaction is off" "$CHECK/out2.txt"; then
   state=passed
 elif grep -q "sec-default@builtin seated outermost: this machine has managed settings" "$CHECK/debug2.txt"; then
   state=organization
@@ -136,5 +139,6 @@ case "$state" in
   *)
     say "   FAIL the mod did not load as this machine's own"; remove; exit 1 ;;
 esac
-say "installed. Next: /reload-plugins in each agent, then /summarize-up-to status."
+say "installed. Next: restart each agent, then /summarize-up-to status. A reload in a process older than this"
+say "version can load both copies of the mod, and the one behind the guard then switches compaction off until a restart."
 say "To update the mod: bash $0 update <git ref>. To undo: bash $0 remove"
