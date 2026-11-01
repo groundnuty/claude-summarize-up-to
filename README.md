@@ -98,12 +98,22 @@ For Team and Enterprise logins, and on machines with managed settings, Claude Co
 Where the guard stands in the mod's way, no compaction runs on its own:
 
 - **Compaction is switched off.** When the mod loads into such a session (including after `/reload-plugins` or a resume), it sets `DISABLE_COMPACT=1` for that Claude Code process alone. No auto-compaction runs, whatever the settings say, and `/compact` becomes an unknown command. At the context limit the agent stops ("Context limit reached") instead of losing its context. Claude Code lets a mod switch compaction off but not back on, so it stays off until the session restarts.
-- **It says so.** It writes "Not cutting: …" into the conversation, and `/summarize-up-to status` leads with the same warning.
+- **It says so.** It writes "Not cutting: …" into the conversation, and `/summarize-up-to status` leads with the same warning. The switch outlives the guard: if a machine policy later seats the mod ahead of the guard in that same process, compaction reaches the mod but stays off until a restart, and the mod says that too.
 - **The way out.** To compact in such a session anyway, start it with `DISABLE_COMPACT=0` in its environment. The mod leaves a value you set alone, and a compaction then summarizes everything.
 - **Child processes inherit it.** Claude Code processes the session starts, such as teammates in an agent team, inherit `DISABLE_COMPACT=1`, so they don't compact either.
 - **Where the switch is refused,** the mod still holds back a typed `/compact` with the reason and the restart command (`/compact full` goes through), but an auto-compaction would then summarize everything.
 
-An administrator can let the mod run by installing it as an organization mod, with the guard kept for every other mod. That means placing a clone of this repository at an admin-only path on each machine and setting:
+**On a machine you administer,** `tools/machine-policy.sh` seats the mod ahead of the guard through a machine policy, with the guard kept for every other mod. It uses sudo for `/opt/claude-plugins` and `/etc/claude-code`, and the policy applies to every Claude Code session on the machine:
+
+```
+bash tools/machine-policy.sh install <git ref> <percent> [project folder ...]
+bash tools/machine-policy.sh update <git ref>
+bash tools/machine-policy.sh remove
+```
+
+Its limit is the organization's. Managed sources are "first-wins": under a login whose organization delivers server-managed settings, even one key, Claude Code ignores the machine file, and a lower source can't opt into merging with the one above it. So the tool also installs the mod in each project you name, as a fallback: under such a login that install loads behind the guard and switches compaction off. The agent then stops at the context limit instead of compacting everything. To cut under that login, its organization has to seat the mod. Keep it out of an account switcher's rotation if it can't.
+
+An organization's administrator can let the mod run by installing it as an organization mod, with the guard kept for every other mod. That means placing a clone of this repository at an admin-only path on each machine and setting:
 
 ```json
 {

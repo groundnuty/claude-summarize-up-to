@@ -214,19 +214,29 @@ const UNREACHED = [
 // stays off until the session ends; a person who wants compaction there anyway
 // starts it with DISABLE_COMPACT=0, which the mod leaves alone.
 const OFF = 'DISABLE_COMPACT'
-let isSwitchedOff = false
 
-async function switchOff($: EngineInterface): Promise<boolean> {
-  if (isSwitchedOff) return true
-  if ((await $.env.get('DISABLE_COMPACT').catch(() => undefined)) !== undefined) return false
-  const done = await $.env.set('DISABLE_COMPACT', '1').catch(() => ({ deny: 'failed' }))
-  isSwitchedOff = done.deny === undefined
+// Set before a reload by this mod, which cannot clear it, or by the person:
+// read as Claude Code reads such a variable.
+const isCompactionOff = async ($: EngineInterface): Promise<boolean> => {
+  const value = await $.env.get('DISABLE_COMPACT').catch(() => undefined)
 
-  return isSwitchedOff
+  return value !== undefined && ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
 }
 
-const SWITCHED_OFF = `So the mod has switched compaction off in this session (${OFF}=1, which nothing but a restart undoes): no auto-compaction runs here, /compact is an unknown command, and at the context limit the agent stops rather than lose its context. To compact here anyway, start the session with ${OFF}=0 in its environment; the mod then leaves compaction alone, and a compaction summarizes everything.`
+async function switchOff($: EngineInterface): Promise<string> {
+  if (await isCompactionOff($)) return SWITCHED_OFF
+  if ((await $.env.get('DISABLE_COMPACT').catch(() => undefined)) !== undefined) return LEFT_ON
+  const done = await $.env.set('DISABLE_COMPACT', '1').catch(() => ({ deny: 'failed' }))
+
+  return done.deny === undefined ? SWITCHED_OFF : NOT_SWITCHED_OFF
+}
+
+const SWITCHED_OFF = `So compaction is off in this session (${OFF}=1, which nothing but a restart undoes): no auto-compaction runs here, /compact is an unknown command, and at the context limit the agent stops rather than lose its context. To compact here anyway, start the session with ${OFF}=0 in its environment; the mod then leaves compaction alone, and a compaction summarizes everything.`
+const LEFT_ON = `${OFF} in this session's environment keeps compaction on, so the mod leaves it: a /compact you type is held back, but /compact full and an auto-compaction summarize everything.`
 const NOT_SWITCHED_OFF = `The mod could not switch compaction off here: a /compact you type is held back, but an auto-compaction would summarize everything.`
+// Compaction reaches the mod, yet none can start: the variable outlives the
+// guard's reason for it, as when a machine policy seats the mod after a reload.
+const OFF_HERE = `Compaction is off in this session (${OFF}=1, from its environment or from this mod while the session was guarded; nothing but a restart undoes it): no compaction runs here, this mod's cuts included, and /compact is an unknown command. Restart the session to switch it on: /exit, then claude --resume <id>.`
 
 // What a held-back /compact says, with the way to cut and the way not to.
 async function heldBack($: EngineInterface): Promise<string> {
@@ -324,6 +334,9 @@ async function answer($: EngineInterface, args: string): Promise<string> {
     return `${had ? 'Armed cut dropped.' : 'No cut was armed.'} ${shareLine(await standingShare($))}`
   }
   if (ask.kind === 'status') {
+    // First: switching compaction off changes the threshold line below.
+    const isReached = await probe($)
+    const lead = isReached ? ((await isCompactionOff($)) ? [OFF_HERE, ''] : []) : [UNREACHED, await switchOff($), '']
     const context = await $.session.usage({ breakdown: 'summary' }).then(u => u.context, () => undefined)
     const window = context?.breakdown
     const at =
@@ -335,10 +348,8 @@ async function answer($: EngineInterface, args: string): Promise<string> {
 
     // Where compaction cannot reach the mod, that leads: the shares below it
     // would not apply.
-    const isReached = await probe($)
-
     return [
-      ...(isReached ? [] : [UNREACHED, (await switchOff($)) ? SWITCHED_OFF : NOT_SWITCHED_OFF, '']),
+      ...lead,
       shareLine(await standingShare($)),
       ...(armed !== undefined ? [`Armed for the next /compact only: everything before ${armed.described}.`] : []),
       `Partial auto-compaction: ${auto.isOn ? `on, summarizing the oldest ${auto.percent}%` : 'off'} (/config: ${NAME} options).`,
@@ -357,6 +368,7 @@ async function answer($: EngineInterface, args: string): Promise<string> {
   if (ask.kind === 'list')
     return `${listing(turns.cuts)}\n\n${shareLine(await standingShare($))}\n${isReached ? 'Compaction reaches this mod in this session.' : UNREACHED}`
   if (!isReached) return UNREACHED
+  const offNote = (await isCompactionOff($)) ? `${OFF_HERE}\n\n` : ''
 
   // A share set for every /compact: kept, and what it comes to now. A cut
   // armed at a listed point before it no longer stands.
@@ -374,7 +386,7 @@ async function answer($: EngineInterface, args: string): Promise<string> {
     if (chosen === undefined)
       return `Set: every /compact in this project now summarizes the oldest ${ask.percent}%, until you set another share. Nothing to cut yet: the conversation has no point to cut at.${stored}`
 
-    return `${confirmation(rows, view, chosen, { percent: ask.percent }, await tokensOf($))}${stored}`
+    return `${offNote}${confirmation(rows, view, chosen, { percent: ask.percent }, await tokensOf($))}${stored}`
   }
 
   const chosen = turns.cuts[ask.ordinal - 1]
@@ -385,7 +397,7 @@ async function answer($: EngineInterface, args: string): Promise<string> {
     described: describe(chosen),
   }
 
-  return confirmation(rows, turns, chosen, undefined, await tokensOf($))
+  return `${offNote}${confirmation(rows, turns, chosen, undefined, await tokensOf($))}`
 }
 
 export const register: Register = (on, options) => {
@@ -413,8 +425,8 @@ export const register: Register = (on, options) => {
     // compacts. Once the session has settled.
     $.clock.after(STARTUP_MS, () => {
       void (async () => {
-        if (await probe($)) return
-        $.ui.log(`${UNREACHED}\n${(await switchOff($)) ? SWITCHED_OFF : NOT_SWITCHED_OFF}`)
+        if (!(await probe($))) $.ui.log(`${UNREACHED}\n${await switchOff($)}`)
+        else if (await isCompactionOff($)) $.ui.log(OFF_HERE)
       })().catch(() => undefined)
     })
 

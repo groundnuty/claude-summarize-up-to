@@ -780,3 +780,27 @@ test('where compaction reaches the mod, /compact runs as typed and nothing warns
   expect(ran).toEqual(['', 'full', 'keep the API decisions'])
   expect(logs.filter(text => text.startsWith('Not cutting') || text.startsWith('held back /compact'))).toEqual([])
 })
+
+// The warning at load needs session.start, which the kit does not raise: the
+// end-to-end "off" scenario proves it.
+test('where compaction reaches the mod but is off for the process, the status and a share say so', async ($, on) => {
+  mock.clock(on)
+  on('session.messages', () => ({ value: ROWS }))
+  on('env.get', () => ({ value: '1' }) as never)
+
+  const status = await $.command.run(typed('status'))
+  expect(status.text).toMatch(/^Compaction is off in this session \(DISABLE_COMPACT=1/)
+  expect(status.text).toMatch(/Compaction reaches this mod in this session/)
+
+  const set = await $.command.run(typed('50%'))
+  expect(set.text).toMatch(/^Compaction is off in this session/)
+})
+
+test('DISABLE_COMPACT=0 keeps compaction on: nothing warns', async ($, on) => {
+  mock.clock(on)
+  on('session.messages', () => ({ value: ROWS }))
+  on('env.get', () => ({ value: '0' }) as never)
+
+  const status = await $.command.run(typed('status'))
+  expect(status.text).not.toMatch(/Compaction is off/)
+})

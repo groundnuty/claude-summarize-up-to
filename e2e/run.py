@@ -551,10 +551,10 @@ def scenario_guarded(session, check, log, debug, work):
     seated = any("sec-default@builtin seated" in line for line in open(debug, errors="replace"))
     check(seated, "Claude Code's security default is seated (a test policy, in this session alone)")
     deadline = time.time() + 30
-    while time.time() < deadline and not ui_logged(debug, "has switched compaction off in this session"):
+    while time.time() < deadline and not ui_logged(debug, "So compaction is off in this session"):
         time.sleep(2)
     check(ui_logged(debug, "Not cutting: in this session Claude Code keeps compaction away"), "the mod warns at once that it cannot cut here")
-    check(ui_logged(debug, "has switched compaction off in this session"), "and switches compaction off for this session")
+    check(ui_logged(debug, "So compaction is off in this session"), "and switches compaction off for this session")
     check(ui_logged(debug, "start the session with DISABLE_COMPACT=0"), "and says how to compact there anyway")
     session.send("/summarize-up-to status")
     flat = re.sub(r"\s+", " ", session.pane())
@@ -589,6 +589,32 @@ def scenario_guarded(session, check, log, debug, work):
     session.send("/compact full", quiet=True)
     time.sleep(5)
     check(len(boundaries(session.entries())) == count, "/compact full does not run either: nothing compacts here")
+
+    # A reload: the mod meets its own earlier switch, and must not call it someone else's.
+    session.send("/reload-plugins", quiet=True)
+    time.sleep(8)
+    check(not ui_logged(debug, "could not switch compaction off"), "after a reload, no false alarm about the switch")
+    session.send("/summarize-up-to status")
+    check("So compaction is off in this session" in re.sub(r"\s+", " ", session.pane()), "after a reload, the status still says compaction is off")
+    return None
+
+
+def scenario_off(session, check, log, debug):
+    """DISABLE_COMPACT=1 in a session compaction would reach, as after a reload
+    under a machine policy that followed a guarded time: the mod says compaction
+    is off and how to get it back, and nothing compacts."""
+    deadline = time.time() + 30
+    while time.time() < deadline and not ui_logged(debug, "Compaction is off in this session"):
+        time.sleep(2)
+    check(ui_logged(debug, "Compaction is off in this session"), "the mod warns at load that compaction is off")
+    session.send("/summarize-up-to status")
+    flat = re.sub(r"\s+", " ", session.pane())
+    check("Compaction is off in this session" in flat, "the status leads with it")
+    check("Compaction reaches this mod in this session" in flat, "and still says compaction reaches the mod")
+    session.send("Start your reply with the code word ALPHA, then write one sentence about a city.")
+    session.send("/compact", quiet=True)
+    time.sleep(5)
+    check(not boundaries(session.entries()), "a /compact does not run")
     return None
 
 
@@ -621,10 +647,10 @@ def scenario_auto(session, check, log, filler, debug):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default", "auto-midturn", "guarded"],
+    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default", "auto-midturn", "guarded", "off"],
                         help="auto: threshold from CLAUDE_CODE_AUTO_COMPACT_WINDOW; auto-setting: from the "
                              "autoCompactWindow setting /autocompact writes; auto-default: Claude Code's own; "
-                             "guarded: Claude Code's security default seated (Linux, bwrap)")
+                             "guarded: Claude Code's security default seated (Linux, bwrap); off: DISABLE_COMPACT=1 where compaction reaches the mod")
     parser.add_argument("--keep", action="store_true", help="leave the tmux session running afterwards")
     parser.add_argument("--tag", default="", help="a suffix for the tmux session name, to run copies side by side")
     args = parser.parse_args()
@@ -644,6 +670,8 @@ def main():
     claude_args = ["--model", MODEL, "--permission-mode", "default", "--setting-sources", "project", "--settings", flags,
                    "--strict-mcp-config", "--tools", "Bash", "--plugin-dir", REPO, "--debug-file", debug]
     env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario in ("auto", "auto-midturn", "guarded") else {}
+    if args.scenario == "off":
+        env = {"DISABLE_COMPACT": "1"}
     wrap = ()
     if args.scenario == "guarded":
         # A policy with one inert setting, at /etc/claude-code for this session alone.
@@ -670,6 +698,8 @@ def main():
                 f.writelines(f"note {i}.{n:04d}: a reference line the end-to-end test attaches; nothing to act on.\n" for n in range(200))
         if args.scenario == "guarded":
             kept = scenario_guarded(session, check, log, debug, work)
+        elif args.scenario == "off":
+            kept = scenario_off(session, check, log, debug)
         elif args.scenario == "auto-midturn":
             kept = scenario_midturn(session, check, log, os.path.join(work, "filler.txt"), debug, work)
         elif args.scenario.startswith("auto"):
