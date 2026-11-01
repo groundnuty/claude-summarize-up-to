@@ -49,6 +49,10 @@ class Session:
         tmux("kill-session", "-t", f"={name}")
         command = " ".join(["env"] + [f"{k}={v}" for k, v in env.items()] + [CLAUDE] + [quote(a) for a in args])
         tmux("new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", cwd, command)
+        # A tmux set to "window-size latest" sizes a detached window after other
+        # clients (102x11 on one machine), whatever -x and -y say; resizing it
+        # also makes its size manual.
+        tmux("resize-window", "-t", f"={name}:", "-x", "200", "-y", "50")
         self.started = time.time()
         deadline = time.time() + 60
         while time.time() < deadline:
