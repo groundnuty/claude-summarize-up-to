@@ -24,29 +24,33 @@ Installed at user scope, the mod is active in every session you start afterwards
 
 ## Use
 
-A cut takes two steps: the command arms it and tells you what will happen, and your `/compact` carries it out.
+Set the share once; every `/compact` then summarizes that much of the oldest conversation and keeps the rest verbatim, until you set another share. The setting is per project, so each agent keeps its own, and it outlives restarts.
 
 ```
-❯ /summarize-up-to 70%
-  Armed: /compact will summarize everything before the step at 68% ("calls Bash: make test").
-  You asked for 70%; 68% is the nearest point that keeps tool calls whole.
-  Summarized: 412 messages (68%, about 120k tokens). Kept verbatim: 236 messages (32%, about 56k tokens).
+❯ /summarize-up-to 20%
+  Set: every /compact in this project now summarizes the oldest 20%, until you set another share.
+  Now that is everything before the step at 21% ("calls Bash: make test").
+  21% is the nearest point to 20% that keeps tool calls whole.
+  Summarized: 128 messages (21%, about 37k tokens). Kept verbatim: 520 messages (79%, about 139k tokens).
   Shares are of what the model reads: about 176k tokens of conversation by Claude Code's count.
-  Type /compact to go ahead, or /summarize-up-to cancel.
+  Type /compact to compact now; /compact full summarizes everything, this once.
 ❯ /compact
-  summarize-up-to: summarized everything before the step at 68% ("calls Bash: make test"). That message and everything after it are kept verbatim.
+  summarize-up-to: summarized everything before the step at 21% ("calls Bash: make test"). That message and everything after it are kept verbatim. Every /compact here summarizes the oldest 20%, until you set another share.
   summarize-up-to: saved the cut so that a restart or resume keeps it (corrected 37 links Claude Code wrote to before the compaction).
 ```
 
 | Command | What it does |
 | --- | --- |
+| `/summarize-up-to 20% [notes]` | Every `/compact` in this project summarizes the oldest 20%, until you set another share. The reply shows what that comes to now. Notes go to the next summary |
+| `/summarize-up-to 0%` | Every `/compact` summarizes the whole conversation again, as without the mod |
+| `/compact` | Summarizes the share set for this project; until you set one, the `/config` option **Share to summarize on /compact** (65% unless changed) |
+| `/compact full` | Summarizes the whole conversation, this once |
 | `/summarize-up-to` | Lists the cut points: your prompts and the notifications between turns |
-| `/summarize-up-to 70% [notes]` | Arms a cut at the point nearest 70% of the conversation: a prompt or notification, or a step between two tool round-trips, so long agent-driven turns can be cut too. A cut never separates a tool call from its result, or a prompt from the reply it asked for |
-| `/summarize-up-to #12 [notes]` | Arms a cut at a listed cut point |
-| `/summarize-up-to status` | Shows the armed cut, partial auto-compaction, and when Claude Code auto-compacts |
-| `/summarize-up-to cancel` | Drops the armed cut |
+| `/summarize-up-to #12 [notes]` | The next `/compact` only: summarize everything before listed point 12 |
+| `/summarize-up-to cancel` | Drops a cut armed with `#n` |
+| `/summarize-up-to status` | Shows the share `/compact` uses and where it comes from, partial auto-compaction, and when Claude Code auto-compacts |
 
-Optional notes are passed to the summarizer together with any you give `/compact <notes>`.
+A cut falls at a prompt or notification, or at a step between two tool round-trips, so long agent-driven turns can be cut too. It never separates a tool call from its result, or a prompt from the reply it asked for. Notes are passed to the summarizer together with any you give `/compact <notes>`. The mod keeps each project's share in its own store, under the project's folder.
 
 The percentage is a share of what the model reads. That includes what the mod's view of the conversation leaves out: messages from other sessions, attached files, and queued commands. The token figures split Claude Code's own count of the conversation (not the system prompt or tools) by that share. In the end-to-end runs on Claude 5 models, they came within about 15% of what then left the model's input. On Claude 4.x models they ran up to 1.6× high. The percentage is a target. The cut snaps to the nearest point that keeps tool calls whole, which can be some way off when single messages are large. The confirmation says where it landed.
 
@@ -68,7 +72,7 @@ python3 tools/relink.py --session <session id> --write      # or write a repaire
 
 ### Partial auto-compaction
 
-Turn on **Partial auto-compaction** in `/config` (the mod's options), and set **Share to summarize** (default 65%). From then on, every auto-compaction summarizes that share of the oldest conversation and keeps the rest verbatim. Claude Code still decides when to compact. To compact at 90% of a 1M-token window:
+Turn on **Partial auto-compaction** in `/config` (the mod's options), and set **Share to summarize** (default 65%), which is separate from the share for `/compact`. From then on, every auto-compaction summarizes that share of the oldest conversation and keeps the rest verbatim. Claude Code still decides when to compact. To compact at 90% of a 1M-token window:
 
 ```
 /autocompact 900k
@@ -85,7 +89,7 @@ Claude Code reaches an auto-compaction by more than one route. The end-to-end te
 | the default, 1M-window model | reactive, at about 967k tokens | yes |
 | the default, 200k-window model | compacting directly, at about 167k tokens | yes |
 
-Claude Code can also compute an auto-compaction ahead of time and install it at the threshold without asking any mod again. That is behind a Claude Code server flag, which was off in every test. With partial auto-compaction on, the mod declines that precomputation, so every auto-compaction comes through the mod. A manual `/compact` never reuses a precomputed summary while a cut is armed.
+Claude Code can also compute an auto-compaction ahead of time and install it at the threshold without asking any mod again. That is behind a Claude Code server flag, which was off in every test. With partial auto-compaction on, the mod declines that precomputation, so every auto-compaction comes through the mod. A `/compact` that the mod cuts never reuses a precomputed summary, because the mod passes the summarizer instructions of its own.
 
 ## Team and Enterprise organizations
 

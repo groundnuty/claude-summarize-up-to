@@ -12,12 +12,13 @@ Each run starts a real, interactive Claude Code in a detached tmux session and a
 
 | Scenario | What it does | What must hold |
 | --- | --- | --- |
-| `manual` | 10 code-word turns, every third with two `echo` tool calls, three with an @-mentioned 4k-token file the mod's rows do not show; `/summarize-up-to status`; `  /summarize-up-to 60%` typed after spaces; a 15 s wait; ` /compact` typed after a space; Enter on what the box then holds | The leading-space command runs and empties the box. The confirmation gives counts, shares of what the model reads, and Claude Code's tokens, and nothing compacts. ` /compact` reaches neither the model nor compaction, and the box then holds `/compact`. Enter on it compacts (`manual`). The mod reports its cut. The summarized tokens the confirmation gave are within 0.6–1.6× of what left the model's input |
+| `manual` | 10 code-word turns, every third with two `echo` tool calls, three with an @-mentioned 4k-token file the mod's rows do not show; `/summarize-up-to status`; `  /summarize-up-to 60%` typed after spaces, which sets the share for every `/compact`; a 15 s wait; ` /compact` typed after a space; Enter on what the box then holds | The leading-space command runs and empties the box, and stores the share to outlive the session. The confirmation gives counts, shares of what the model reads, and Claude Code's tokens, and nothing compacts. ` /compact` reaches neither the model nor compaction, and the box then holds `/compact`. Enter on it compacts (`manual`). The mod reports its cut. The summarized tokens the confirmation gave are within 0.6–1.6× of what left the model's input |
 | `auto` | Code-word turns with pasted filler until Claude Code auto-compacts on its own, with the mod's partial auto-compaction on at 65%. The threshold comes from `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000` | The compaction is `auto` |
 | `auto-setting` | The same, with the threshold from the `autoCompactWindow` setting, as `/autocompact` writes it | The same |
 | `auto-default` | The same, at Claude Code's own default threshold. With claude-haiku-5-5 that is 967k tokens: about 15 minutes and roughly 5M tokens of haiku input | The same |
 | each, after the compaction | | The mod's closing message is gone from the conversation. Verbatim text starts exactly where the mod reports it does. The newest replies stay verbatim and in order, the older ones appear only in the summary, which names them, and the model quotes the kept replies exactly and none of the others. The mod said it saved the cut for restarts, and `tools/relink.py`, reading only, finds the transcript whole as saved |
 | each, then | `/exit`, and `claude --resume` of the same session in a fresh tmux session | The model again quotes exactly the kept replies and none of the summarized ones |
+| `manual`, then | `/summarize-up-to status`; four more turns; a plain `/compact`; `/compact full` | The 60% share still stands after the restart; the plain `/compact` cuts at it again, nothing re-armed; `/compact full` summarizes everything, no reply kept |
 
 Each auto scenario first reads the threshold from `/summarize-up-to status` and sizes its pastes so that the compaction comes after about ten turns. It reports the route Claude Code took, from its debug log. `E2E_MODEL=claude-haiku-4-5` runs a scenario on a 200k-window model, where Claude Code's default auto-compaction compacts directly instead of reactively. On that model the confirmation's token figures can exceed the 1.6× bound (see the main README), so those runs show the route and the cut, not a release gate. `--tag x` names the tmux session apart, to run copies of one scenario side by side.
 
@@ -37,7 +38,7 @@ Do not edit the repository while a run is going: Claude Code reloads a `--plugin
 
 ## After a run
 
-The tmux session is closed (keep it with `--keep`). The test folder and its `debug.txt` stay in `/tmp/sut-e2e-*`. The transcripts stay where Claude Code writes them: `~/.claude/projects/-private-tmp-sut-e2e-*` on macOS, `~/.claude/projects/-tmp-sut-e2e-*` on Linux. The run prints both paths. Remove them when you no longer need them:
+The tmux session is closed (keep it with `--keep`). The mod keeps the share each test folder set in its store, under that folder's path. The test folder and its `debug.txt` stay in `/tmp/sut-e2e-*`. The transcripts stay where Claude Code writes them: `~/.claude/projects/-private-tmp-sut-e2e-*` on macOS, `~/.claude/projects/-tmp-sut-e2e-*` on Linux. The run prints both paths. Remove them when you no longer need them:
 
 ```
 rm -r /tmp/sut-e2e-* ~/.claude/projects/-*tmp-sut-e2e-*

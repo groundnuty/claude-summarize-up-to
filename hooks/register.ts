@@ -13,10 +13,12 @@ const RELINK_TRIES = 5
 
 const USAGE = [
   `/${NAME}            list the cut points: your prompts and the notifications between turns`,
-  `/${NAME} 70% [notes] arm a cut at the step nearest 70%, inside a turn too; then type /compact`,
-  `/${NAME} #12 [notes] arm a cut at listed point 12; then type /compact`,
-  `/${NAME} cancel      drop the armed cut`,
-  `/${NAME} status      the armed cut, partial auto-compaction, and when Claude Code auto-compacts`,
+  `/${NAME} 20% [notes] every /compact in this project summarizes the oldest 20%, until you set another share`,
+  `/${NAME} 0%          every /compact summarizes the whole conversation, as without the mod`,
+  `/${NAME} #12 [notes] the next /compact only: summarize everything before listed point 12`,
+  `/${NAME} cancel      drop a cut armed with #n`,
+  `/${NAME} status      the share /compact uses, partial auto-compaction, and when Claude Code auto-compacts`,
+  '/compact full              summarize the whole conversation, this once',
 ].join('\n')
 
 type Ask =
@@ -108,31 +110,78 @@ function viewOf(rows: readonly SessionMessage[], api: Awaited<ReturnType<typeof 
 
 const messages = (n: number): string => `${n} message${n === 1 ? '' : 's'}`
 
-// What /compact will do with the armed cut, said before anything happens.
-function confirmation(rows: readonly SessionMessage[], view: View, cut: Cut, asked?: number, tokens?: number): string {
+// What /compact will do, said before anything happens: for a share set for
+// every /compact, what it comes to now; for a cut armed once, where it falls.
+function confirmation(
+  rows: readonly SessionMessage[],
+  view: View,
+  cut: Cut,
+  set: { percent: number } | undefined,
+  tokens?: number,
+): string {
   // Tokens split by share only where the shares are of what the model reads.
   const share = (percent: number): string =>
     tokens === undefined || !view.isWeighed ? `${percent}%` : `${percent}%, ${thousands((tokens * percent) / 100)}`
 
   return [
-    `Armed: /compact will summarize everything before ${describe(cut)}.`,
-    ...(asked !== undefined && asked !== cut.percent
-      ? [`You asked for ${asked}%; ${cut.percent}% is the nearest point that keeps tool calls whole.`]
-      : []),
+    ...(set !== undefined
+      ? [
+          `Set: every /compact in this project now summarizes the oldest ${set.percent}%, until you set another share.`,
+          `Now that is everything before ${describe(cut)}.`,
+          ...(set.percent !== cut.percent ? [`${cut.percent}% is the nearest point to ${set.percent}% that keeps tool calls whole.`] : []),
+        ]
+      : [`Armed for the next /compact only: it will summarize everything before ${describe(cut)}.`]),
     `Summarized: ${messages(cut.index)} (${share(cut.percent)}). Kept verbatim: ${messages(rows.length - cut.index)} (${share(100 - cut.percent)}).`,
     view.isWeighed
       ? `Shares are of what the model reads${tokens === undefined ? '' : `: ${thousands(tokens)} of conversation by Claude Code's count`}.`
       : 'Shares are of the visible messages alone: the conversation as the model reads it could not be matched to them.',
-    `Type /compact to go ahead, or /${NAME} cancel.`,
+    set !== undefined
+      ? 'Type /compact to compact now; /compact full summarizes everything, this once.'
+      : `Type /compact to go ahead, or /${NAME} cancel.`,
   ].join('\n')
 }
 
-// The cut the command armed, applied by the person's next /compact. The mod
-// never starts a compaction itself: Claude Code does not run a mod's
-// session.compact hook on a compaction that mod started, so the cut would be
-// lost and the whole conversation summarized. A reload drops the armed cut.
+// The share every plain /compact summarizes, per project (the session's root
+// folder): set with the command and kept in the mod's store across sessions;
+// until then, the /config option. Kept in memory too, should the store fail.
+let plainDefault = 65
+const sessionShares = new Map<string, number>()
+
+async function shareKey($: EngineInterface): Promise<string> {
+  return `share:${await $.session.root().catch(() => '')}`
+}
+
+async function standingShare($: EngineInterface): Promise<{ percent: number; isSet: boolean }> {
+  const key = await shareKey($)
+  const stored = await $.store.get(key).catch(() => undefined)
+  const percent = typeof stored === 'number' ? stored : sessionShares.get(key)
+
+  return percent === undefined ? { percent: plainDefault, isSet: false } : { percent, isSet: true }
+}
+
+async function setShare($: EngineInterface, percent: number): Promise<boolean> {
+  const key = await shareKey($)
+  sessionShares.set(key, percent)
+
+  return $.store.set(key, percent).then(
+    () => true,
+    () => false,
+  )
+}
+
+const shareLine = (share: { percent: number; isSet: boolean }): string =>
+  share.percent === 0
+    ? `/compact summarizes the whole conversation (${share.isSet ? `set with /${NAME} 0%` : '/config default'}).`
+    : `/compact summarizes the oldest ${share.percent}% (${share.isSet ? `set with /${NAME}` : '/config default'}); /compact full summarizes everything.`
+
+// A cut armed at a listed point (#n), applied by the person's next /compact
+// only; notes given with a share go with the next /compact too. The mod never
+// starts a compaction itself: Claude Code does not run a mod's session.compact
+// hook on a compaction that mod started, so the cut would be lost and the whole
+// conversation summarized. A reload drops both.
 type Armed = { want: Want; notes: string; described: string }
 let armed: Armed | undefined
+let nextNotes = ''
 // Set while the compaction hook cuts, and until the next compaction, for its
 // catch handler.
 let cutting = false
@@ -232,10 +281,11 @@ async function answer($: EngineInterface, args: string): Promise<string> {
   const ask = parse(args)
   if (ask.kind === 'usage') return USAGE
   if (ask.kind === 'cancel') {
-    const had = armed !== undefined
+    const had = armed !== undefined || nextNotes !== ''
     armed = undefined
+    nextNotes = ''
 
-    return had ? 'Armed cut dropped; /compact summarizes the whole conversation again.' : 'No cut was armed.'
+    return `${had ? 'Armed cut dropped.' : 'No cut was armed.'} ${shareLine(await standingShare($))}`
   }
   if (ask.kind === 'status') {
     const context = await $.session.usage({ breakdown: 'summary' }).then(u => u.context, () => undefined)
@@ -248,7 +298,8 @@ async function answer($: EngineInterface, args: string): Promise<string> {
           : `Claude Code auto-compacts at ${Math.round(window.autoCompactThreshold / 1000)}k tokens (${Math.round((100 * window.autoCompactThreshold) / window.rawMaxTokens)}% of ${Math.round(window.rawMaxTokens / 1000)}k)`
 
     return [
-      armed !== undefined ? `Armed: /compact will summarize everything before ${armed.described}.` : 'No cut is armed.',
+      shareLine(await standingShare($)),
+      ...(armed !== undefined ? [`Armed for the next /compact only: everything before ${armed.described}.`] : []),
       `Partial auto-compaction: ${auto.isOn ? `on, summarizing the oldest ${auto.percent}%` : 'off'} (/config: ${NAME} options).`,
       `${at}; the context is ${context?.percent ?? '?'}% full. Set the threshold with /autocompact, e.g. /autocompact 900k.`,
       (await probe($)) ? 'Compaction reaches this mod in this session.' : UNREACHED,
@@ -262,28 +313,38 @@ async function answer($: EngineInterface, args: string): Promise<string> {
   const api = await apiOf($)
   const turns = viewOf(rows, api, false)
   const isReached = await probe($)
-  if (ask.kind === 'list') return `${listing(turns.cuts)}\n\n${isReached ? 'Compaction reaches this mod in this session.' : UNREACHED}`
+  if (ask.kind === 'list')
+    return `${listing(turns.cuts)}\n\n${shareLine(await standingShare($))}\n${isReached ? 'Compaction reaches this mod in this session.' : UNREACHED}`
   if (!isReached) return UNREACHED
 
-  const view = ask.kind === 'percent' ? viewOf(rows, api, true) : turns
-  const aligned = api === undefined ? undefined : alignmentOf(rows, api)
-  if (api !== undefined && aligned !== undefined) $.ui.log(`arming; ${alignmentNote(rows, api, aligned)}`, { to: 'debug' })
-  const chosen = ask.kind === 'percent' ? pick(view.cuts, { percent: ask.percent }) : turns.cuts[ask.ordinal - 1]
-  if (chosen === undefined)
-    return ask.kind === 'percent'
-      ? 'Nothing to cut yet: the conversation has no message after its first.'
-      : `No such cut point; there are ${turns.cuts.length}.\n\n${listing(turns.cuts)}`
+  // A share set for every /compact: kept, and what it comes to now. A cut
+  // armed at a listed point before it no longer stands.
+  if (ask.kind === 'percent') {
+    armed = undefined
+    nextNotes = ask.notes.trim()
+    const isStored = await setShare($, ask.percent)
+    const stored = isStored ? '' : '\nThe mod could not store the share, so it holds for this session only.'
+    if (ask.percent === 0)
+      return `Set: every /compact in this project now summarizes the whole conversation, as without the mod, until you set another share.${stored}`
+    const view = viewOf(rows, api, true)
+    const aligned = api === undefined ? undefined : alignmentOf(rows, api)
+    if (api !== undefined && aligned !== undefined) $.ui.log(`share set; ${alignmentNote(rows, api, aligned)}`, { to: 'debug' })
+    const chosen = pick(view.cuts, { percent: ask.percent })
+    if (chosen === undefined)
+      return `Set: every /compact in this project now summarizes the oldest ${ask.percent}%, until you set another share. Nothing to cut yet: the conversation has no point to cut at.${stored}`
 
+    return `${confirmation(rows, view, chosen, { percent: ask.percent }, await tokensOf($))}${stored}`
+  }
+
+  const chosen = turns.cuts[ask.ordinal - 1]
+  if (chosen === undefined) return `No such cut point; there are ${turns.cuts.length}.\n\n${listing(turns.cuts)}`
   armed = {
-    want:
-      ask.kind === 'percent'
-        ? { percent: ask.percent }
-        : { fromEnd: turns.cuts.length - ask.ordinal + 1, preview: chosen.preview },
+    want: { fromEnd: turns.cuts.length - ask.ordinal + 1, preview: chosen.preview },
     notes: ask.notes,
     described: describe(chosen),
   }
 
-  return confirmation(rows, view, chosen, ask.kind === 'percent' ? ask.percent : undefined, await tokensOf($))
+  return confirmation(rows, turns, chosen, undefined, await tokensOf($))
 }
 
 export const register: Register = (on, options) => {
@@ -291,6 +352,7 @@ export const register: Register = (on, options) => {
     isOn: options.auto_compact === true,
     percent: typeof options.summarize_percent === 'number' ? options.summarize_percent : DEFAULT_PERCENT,
   }
+  plainDefault = typeof options.compact_percent === 'number' ? options.compact_percent : DEFAULT_PERCENT
 
   // Observe only: every read gets the engine's answer unchanged.
   on('settings.read', ($, e, next) => {
@@ -302,8 +364,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: NAME,
-      description: 'Arm a cut at any point, inside agent-driven turns too; /compact then summarizes only what precedes it',
-      argumentHint: '[#n | n% | cancel | status] [notes]',
+      description: 'Set the share every /compact summarizes, keeping the rest verbatim; or cut once at a listed point',
+      argumentHint: '[n% | #n | cancel | status] [notes]',
     })
 
     return next(e)
@@ -348,13 +410,28 @@ export const register: Register = (on, options) => {
     // own). With partial auto-compaction on, the mod declines that, so the
     // compaction at the threshold comes through here as trigger auto.
     if (e.trigger === 'precompute' && auto.isOn) return { skip: `${NAME} cuts each auto-compaction when it runs` }
-    // An armed cut applies to the person's /compact; with auto mode on, every
-    // auto-compaction gets the configured share.
-    const manual = e.trigger === 'manual' ? armed : undefined
+    // The person's /compact: a cut armed at a listed point, else the share set
+    // for every /compact, which stays; "/compact full" summarizes everything.
+    // With auto mode on, every auto-compaction gets the configured share.
+    const isPerson = e.trigger === 'manual'
+    if (isPerson && /^full$/i.test(e.instructions?.trim() ?? '')) {
+      armed = undefined
+      nextNotes = ''
+
+      return next({ ...e, instructions: undefined })
+    }
+    const standing = isPerson && armed === undefined ? await standingShare($) : undefined
+    const isStanding = standing !== undefined && standing.percent > 0
+    const manual: Armed | undefined = isPerson
+      ? (armed ?? (isStanding ? { want: { percent: standing.percent }, notes: nextNotes, described: '' } : undefined))
+      : undefined
+    if (isPerson) {
+      armed = undefined
+      nextNotes = ''
+    }
     const isAuto = manual === undefined && e.trigger === 'auto' && auto.isOn
     const cut = manual ?? (isAuto ? { want: { percent: auto.percent } as Want, notes: '' } : undefined)
     if (cut === undefined) return next(e)
-    if (manual !== undefined) armed = undefined
 
     const api = await apiOf($)
     const at = pick(viewOf(e.messages, api, 'percent' in cut.want).cuts, cut.want)
@@ -371,7 +448,12 @@ export const register: Register = (on, options) => {
 
       return next(e)
     }
-    if (at === undefined) return { skip: `${$.plugin.name}: the chosen cut point is no longer in the conversation` }
+    if (at === undefined)
+      return {
+        skip: isStanding
+          ? `${NAME}: no point to cut at ${standing.percent}% yet; /compact full summarizes everything`
+          : `${NAME}: the chosen cut point is no longer in the conversation`,
+      }
 
     // Stays set through the return: the engine checks the answer's shape after.
     cutting = true
@@ -408,7 +490,8 @@ export const register: Register = (on, options) => {
       `${isAuto ? 'auto-compaction ' : ''}summarized everything before ${describe({ ...at, percent: summarized })}. That message and everything after it are kept verbatim` +
         (keptFrom < at.index
           ? `, and so ${at.index - keptFrom === 1 ? 'is the message' : `are the ${at.index - keptFrom} messages`} before it, which Claude Code kept: verbatim text starts at "${previewAt(e.messages, keptFrom)}".`
-          : '.'),
+          : '.') +
+        (isStanding ? ` Every /compact here summarizes the oldest ${standing.percent}%, until you set another share.` : ''),
     )
     $.clock.after(RELINK_MS[0] ?? 3000, () => void relink($, since))
 

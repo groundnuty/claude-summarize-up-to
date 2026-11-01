@@ -353,7 +353,9 @@ def scenario_manual(session, check, log, debug):
     count = len(boundaries(session.entries()))
     session.send("  /summarize-up-to 60%", quiet=True)
     pane = session.pane()
-    check("Armed: /compact will summarize everything before" in pane, "'  /summarize-up-to 60%' arms a cut")
+    check("every /compact in this project now summarizes the oldest 60%" in re.sub(r"\s+", " ", pane),
+          "'  /summarize-up-to 60%' sets the share for every /compact")
+    check("could not store the share" not in pane, "the share is stored to outlive the session")
     check(session.box() == "", "the box is empty afterwards", repr(session.box()))
     flat = re.sub(r"\s+", " ", pane)
     numbers = re.search(r"Summarized: \d+ messages \(\d+%, (?:about (\d+)k|under 1k) tokens\)\. Kept verbatim: \d+ messages", flat)
@@ -411,6 +413,38 @@ def write_filler(path, tokens):
     lines = max(50, int(tokens * 4 / 68))
     with open(path, "w") as f:
         f.writelines(f"{i:05d} filler line for the end-to-end test; nothing here to remember.\n" for i in range(lines))
+
+
+def reports(debug):
+    """How many cuts the mod has reported in the debug log."""
+    return sum(1 for line in open(debug, errors="replace")
+               if "[summarize-up-to] $.ui.log:" in line and "summarized everything before" in line)
+
+
+def kept_replies(entries):
+    return [e for e in live_context(entries) if e.get("type") == "assistant" and not e.get("isCompactSummary")
+            and WORD_RE.match(text_of(e).lstrip(" *#"))]
+
+
+def standing(session, check, debug):
+    """After a restart, the share set with the command still stands: a plain
+    /compact cuts at it again, nothing armed; /compact full summarizes all."""
+    session.send("/summarize-up-to status")
+    check("/compact summarizes the oldest 60% (set with /summarize-up-to)" in re.sub(r"\s+", " ", session.pane()),
+          "after the restart, the share set with the command still stands")
+    for word in WORDS[10:14]:
+        session.send(f"Start your reply with the code word {word}, then describe in about 120 words a place whose "
+                     f"name starts with the letter {word[0]}.")
+    count, cuts = len(boundaries(session.entries())), reports(debug)
+    session.send("/compact", timeout=300)
+    entries = session.entries()
+    check(len(boundaries(entries)) == count + 1 and reports(debug) == cuts + 1 and kept_replies(entries),
+          "a plain /compact after the restart cuts at that share again", f"{len(kept_replies(entries))} replies kept")
+    count, cuts = len(boundaries(entries)), reports(debug)
+    session.send("/compact full", timeout=300)
+    entries = session.entries()
+    check(len(boundaries(entries)) == count + 1 and reports(debug) == cuts and not kept_replies(entries),
+          "/compact full summarizes everything", f"{len(kept_replies(entries))} replies kept")
 
 
 def scenario_auto(session, check, log, filler, debug):
@@ -489,6 +523,8 @@ def main():
             session = Session(name, work, claude_args + ["--resume", resumed], env, log)
             log(f"resumed {resumed}")
             quotes(session, check, *kept, after=" after a restart and resume")
+            if args.scenario == "manual":
+                standing(session, check, debug)
     except Abort as error:
         check(False, "the run finished", str(error)[:2000])
     finally:

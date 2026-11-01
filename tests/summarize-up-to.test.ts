@@ -55,7 +55,7 @@ test('with no compaction yet, a settings read shows a cut can apply, and the cut
   const listed = await $.command.run(typed(''))
 
   expect(reads).toBeGreaterThan(0)
-  expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the peer message/)
+  expect(ran.text).toMatch(/^Armed for the next \/compact only: it will summarize everything before the peer message/)
   expect(listed.text).toMatch(/Compaction reaches this mod in this session/)
 })
 
@@ -83,7 +83,7 @@ test('a cut summarizes only what comes before it and keeps the rest whole', asyn
   })
 
   const ran = await $.command.run(typed('#2 keep the API decisions'))
-  expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the peer message at \d+% \("@critic: second result"\)/)
+  expect(ran.text).toMatch(/^Armed for the next \/compact only: it will summarize everything before the peer message at \d+% \("@critic: second result"\)/)
 
   // The person's /compact, as the engine raises it: over the whole
   // transcript, each message carrying its handle, with notes of its own.
@@ -148,11 +148,12 @@ test('with no prompt to cut at, a percentage cuts between steps and keeps each t
   expect(listed.text).toMatch(/^No prompts or messages between turns/)
 
   const ran = await $.command.run(typed('50%'))
-  expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the step at \d+% \("step \d"\)/)
+  expect(ran.text).toMatch(/^Set: every \/compact in this project now summarizes the oldest 50%, until you set another share\./)
+  expect(ran.text).toMatch(/Now that is everything before the step at \d+% \("step \d"\)/)
   // No API form to weigh by here: shares of the rows, and no token figures.
   expect(ran.text).toMatch(/Summarized: \d+ messages \(\d+%\)\. Kept verbatim: \d+ messages \(\d+%\)\./)
   expect(ran.text).toMatch(/Shares are of the visible messages alone/)
-  expect(ran.text).toMatch(/Type \/compact to go ahead, or \/summarize-up-to cancel\.$/)
+  expect(ran.text).toMatch(/Type \/compact to compact now; \/compact full summarizes everything, this once\./)
 
   const done = await $.session.compact({ trigger: 'manual', messages: SOLO })
   const head = (seen?.messages ?? []).filter(m => m.text !== CLOSING)
@@ -243,12 +244,17 @@ test('the person\'s /compact applies the armed cut and says so', async ($, on) =
 
   expect(done.messages?.map(m => m.handle ?? m.text)).toEqual(['SUMMARY', 'h6', 'h7'])
   expect(logs.at(-1)).toMatch(/^summarized everything before the peer message/)
-  // Used once: the next /compact is whole again.
+  // Used once: the next /compact cuts at the share set for every /compact
+  // (65% by default), not at #2.
   const again = await $.session.compact({ trigger: 'manual', messages: ROWS })
-  expect(again.messages?.map(m => m.text)).toEqual(['SUMMARY'])
+  expect(again.messages?.length).toBeGreaterThan(1)
+  expect(logs.at(-1)).toMatch(/Every \/compact here summarizes the oldest 65%/)
 })
 
-test('cancel drops an armed cut', async ($, on) => {
+// With the share for /compact at 0, a plain /compact summarizes everything.
+const WHOLE = { options: { compact_percent: 0 } }
+
+test('cancel drops an armed cut', WHOLE, async ($, on) => {
   let seen: SessionCompactInput | undefined
   mock.clock(on)
   on('session.messages', () => ({ value: ROWS }))
@@ -411,7 +417,7 @@ test('shares follow what the model reads, and tokens come from Claude Code\'s co
   }))
 
   const ran = await $.command.run(typed('#1'))
-  expect(ran.text).toMatch(/^Armed: \/compact will summarize everything before the you message at (8[6-9]|9\d)% /)
+  expect(ran.text).toMatch(/^Armed for the next \/compact only: it will summarize everything before the you message at (8[6-9]|9\d)% /)
   expect(ran.text).toMatch(/Summarized: 2 messages \(91%, about 64k tokens\)\. Kept verbatim: 4 messages \(9%, about 6k tokens\)\./)
   expect(ran.text).toMatch(/Shares are of what the model reads: about 70k tokens of conversation by Claude Code's count\./)
 })
@@ -469,7 +475,7 @@ test('typed after a space, /compact is held back and this command still runs', a
   expect(logs.at(-1)).toMatch(/^held back "\/compact": with a space before the slash it would have gone to the model as text/)
   const arm = await $.prompt.submit(said('  /summarize-up-to #2'))
   expect(arm.drop).toMatch(/^Typed after a space, so summarize-up-to ran it/)
-  expect(logs.at(-1)).toMatch(/^Armed: \/compact will summarize everything before the peer message/)
+  expect(logs.at(-1)).toMatch(/^Armed for the next \/compact only: it will summarize everything before the peer message/)
   // Once Claude Code has put each back: /compact as meant, then an empty box.
   await clock.advance(1000)
   expect(boxes).toEqual(['/compact', ''])
@@ -677,4 +683,72 @@ test('the confirmation counts tokens with the token-count API where Claude Code 
   const ran = await $.command.run(typed('#1'))
   expect(asked[0]).toBe('full')
   expect(ran.text).toMatch(/about 90k tokens of conversation by Claude Code's count/)
+})
+
+test('a share set with the command applies to every /compact, kept in the store', async ($, on) => {
+  const logs: string[] = []
+  mock.clock(on)
+  on('session.messages', () => ({ value: ROWS }))
+  on('session.root', () => ({ value: '/proj' }))
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+
+    return { value: undefined }
+  })
+  on('session.compact', () => ({ messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }))
+
+  const set = await $.command.run(typed('80%'))
+  expect(set.text).toMatch(/^Set: every \/compact in this project now summarizes the oldest 80%/)
+  // The test kit gives the mod no store across sessions: the mod says it holds
+  // the share for this session only. The end-to-end test restarts for real.
+  expect(set.text).toMatch(/could not store the share, so it holds for this session only\.$/)
+
+  // Not used up: each /compact cuts at it.
+  for (const round of [1, 2]) {
+    const done = await $.session.compact({ trigger: 'manual', messages: ROWS })
+    expect(done.messages?.map(m => m.handle ?? m.text), `round ${round}`).toEqual(['SUMMARY', 'h6', 'h7'])
+  }
+  const status = await $.command.run(typed('status'))
+  expect(status.text).toMatch(/^\/compact summarizes the oldest 80% \(set with \/summarize-up-to\)/)
+})
+
+test('/compact full summarizes everything, and 0% makes every /compact do so', async ($, on) => {
+  let seen: SessionCompactInput | undefined
+  mock.clock(on)
+  on('session.messages', () => ({ value: ROWS }))
+  on('session.root', () => ({ value: '/proj' }))
+  on('session.compact', (_, e) => {
+    seen = e
+
+    return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
+  })
+
+  await $.command.run(typed('80%'))
+  await $.session.compact({ trigger: 'manual', messages: ROWS, instructions: 'full' })
+  expect(seen?.messages.length).toBe(ROWS.length)
+  expect(seen?.instructions).toBeUndefined()
+
+  const off = await $.command.run(typed('0%'))
+  expect(off.text).toMatch(/now summarizes the whole conversation, as without the mod/)
+  await $.session.compact({ trigger: 'manual', messages: ROWS })
+  expect(seen?.messages.length).toBe(ROWS.length)
+})
+
+test('until a share is set, /compact uses the /config default; a listed cut overrides it once', { options: { compact_percent: 30 } }, async ($, on) => {
+  let seen: SessionCompactInput | undefined
+  mock.clock(on)
+  on('session.messages', (_, e) => ({ value: e.as === 'api' ? ([] as never) : SOLO }))
+  on('session.root', () => ({ value: '/other' }))
+  on('session.compact', (_, e) => {
+    seen = e
+
+    return { messages: [{ role: 'user', text: 'SUMMARY', toolUses: [] }] }
+  })
+
+  const status = await $.command.run(typed('status'))
+  expect(status.text).toMatch(/^\/compact summarizes the oldest 30% \(\/config default\)/)
+  await $.session.compact({ trigger: 'manual', messages: SOLO })
+  const atDefault = (seen?.messages ?? []).filter(m => m.text !== CLOSING).length
+  expect(atDefault).toBeGreaterThan(1)
+  expect(atDefault).toBeLessThan(SOLO.length / 2)
 })

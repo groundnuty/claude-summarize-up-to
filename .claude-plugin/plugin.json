@@ -1,12 +1,20 @@
 {
   "name": "summarize-up-to",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Summarize the conversation up to any point, inside long agent-driven turns too, keeping everything after it verbatim; optionally make auto-compaction do the same",
   "author": { "name": "groundnuty" },
   "license": "MIT",
   "homepage": "https://github.com/groundnuty/claude-summarize-up-to",
   "repository": "https://github.com/groundnuty/claude-summarize-up-to",
   "userConfig": {
+    "compact_percent": {
+      "type": "number",
+      "title": "Share to summarize on /compact (%)",
+      "description": "Every plain /compact summarizes this share of the oldest conversation and keeps the rest verbatim, until you change it. A cut armed with /summarize-up-to overrides it once; /compact full summarizes everything. 0 makes a plain /compact summarize everything, as without the mod.",
+      "default": 65,
+      "min": 0,
+      "max": 95
+    },
     "auto_compact": {
       "type": "boolean",
       "title": "Partial auto-compaction",
