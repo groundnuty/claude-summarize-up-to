@@ -201,6 +201,16 @@ class Checks:
         self.failed += 0 if ok else 1
 
 
+def reported_step(debug):
+    """The command of the step the mod last cut at, when it cut at one."""
+    found = None
+    for line in open(debug, errors="replace"):
+        if "[summarize-up-to] $.ui.log:" in line and "summarized everything before" in line:
+            step = re.search(r'the step at \d+% \(\\?"calls Bash: ([^"\\]*?)(?:…)?\\?"\)', line)
+            found = step.group(1) if step else None
+    return found
+
+
 def reported_start(debug):
     """The code word where the mod says verbatim text starts, when Claude Code
     kept messages before its cut; None when it starts at the cut."""
@@ -221,7 +231,7 @@ def reported_cut(debug):
     return found.group(1) if found else None
 
 
-def verify(session, check, trigger, used_words, debug):
+def verify(session, check, trigger, used_words, debug, least=2):
     entries = session.entries()
     bs = boundaries(entries)
     check(bool(bs) and bs[-1].get("compactMetadata", {}).get("trigger") == trigger,
@@ -230,8 +240,8 @@ def verify(session, check, trigger, used_words, debug):
         return None
     md = bs[-1]["compactMetadata"]
     check(md.get("postTokens", 0) < md.get("preTokens", 0), "the compaction freed context", f"{md.get('preTokens')} -> {md.get('postTokens')} tokens")
-    cut = reported_cut(debug)
-    check(cut is not None, "the mod reports its cut", f"before {cut}" if cut else "no report in the debug log")
+    cut, step = reported_cut(debug), reported_step(debug)
+    check(reports(debug) > 0, "the mod reports its cut", f"before {cut}" if cut else f"before the step {step!r}" if step else "no report in the debug log")
     live = live_context(entries)
     check(not any(CLOSING in text_of(e) for e in live), "the mod's closing message is not left in the conversation")
     summary = " ".join(text_of(e) for e in live if e.get("isCompactSummary"))
@@ -242,10 +252,16 @@ def verify(session, check, trigger, used_words, debug):
         if m and m.group(1) not in verbatim:
             verbatim.append(m.group(1))
     print(f"  ...   replies kept verbatim: {' '.join(verbatim) or '(none)'}", flush=True)
-    check(len(verbatim) >= 2, "at least two of the newest replies are kept verbatim")
+    check(len(verbatim) >= least, f"at least {least} of the newest replies {'are' if least > 1 else 'is'} kept verbatim")
     check(verbatim == used_words[len(used_words) - len(verbatim):], "the kept replies are exactly the newest ones, in order")
     check(len(verbatim) <= len(used_words) - 2, "at least two of the oldest replies are not kept verbatim")
-    if cut in used_words and verbatim:
+    if step is not None:
+        # A cut inside a turn: the kept part opens on the command the mod named.
+        first = next((e for e in live if e.get("type") == "assistant" and not e.get("isCompactSummary")), None)
+        commands = [b.get("input", {}).get("command", "") for b in ((first or {}).get("message") or {}).get("content") or []
+                    if isinstance(b, dict) and b.get("type") == "tool_use"]
+        check(any(c.startswith(step) for c in commands), "the kept part starts where the mod says", f"kept from {commands}, the mod said {step!r}")
+    elif cut in used_words and verbatim:
         # Claude Code keeps some of what precedes the cut; the mod reports where
         # verbatim text then starts.
         expected = reported_start(debug) or cut
@@ -447,6 +463,73 @@ def standing(session, check, debug):
           "/compact full summarizes everything", f"{len(kept_replies(entries))} replies kept")
 
 
+# The files the mid-turn scenario's tool loop reads: about 6k tokens each,
+# under Claude Code's cap on one command's output.
+PARTS = 5
+
+
+def last_input(entries):
+    """The model's input on its latest answer, in tokens."""
+    return next((real_input(e) for e in reversed(entries)
+                 if e.get("type") == "assistant" and real_input(e) > 0 and (e.get("message") or {}).get("model") != "<synthetic>"), 0)
+
+
+def scenario_midturn(session, check, log, filler, debug, work):
+    """Claude Code crosses its auto-compaction threshold inside a tool loop, as
+    an agent does: filler turns to just under it, then a turn of one-at-a-time
+    cat commands and a closing reply. The compaction must come after that
+    turn's prompt and before its reply, and the turn must finish after it."""
+    threshold, shown = threshold_of(session)
+    log(f"auto-compaction threshold: {shown[0]}k tokens, {shown[1]}% of a {shown[2]}k window" if shown else "auto-compaction threshold: not shown")
+    check(threshold is not None, "Claude Code reports an auto-compaction threshold")
+    if threshold is None:
+        return None
+    write_filler(filler, threshold / 12)
+    for i in range(1, PARTS + 1):
+        with open(os.path.join(work, f"part{i}.txt"), "w") as f:
+            f.writelines(f"{n:05d} part {i} filler line for the end-to-end test; nothing here to remember.\n" for n in range(330))
+    words, used = iter(WORDS), []
+    for word in words:
+        session.send(f"Code word {word}. Ignore the pasted filler; start your reply with the code word, then write "
+                     f"two sentences about a city whose name starts with {word[0]}.", paste=filler, timeout=300)
+        used.append(word)
+        if boundaries(session.entries()):
+            check(False, "the build-up stays under the threshold", f"compacted after {len(used)} turns")
+            return None
+        if last_input(session.entries()) >= threshold - 26000:
+            break
+    log(f"{len(used)} build-up turns; input {last_input(session.entries())} tokens, threshold {threshold}")
+    loop = next(words)
+    count = len(boundaries(session.entries()))
+    commands = ", ".join(f"cat part{i}.txt" for i in range(1, PARTS + 1))
+    session.send(f"Code word {loop}. Run these {PARTS} commands one at a time, each as its own Bash call, and wait for "
+                 f"each result before the next: {commands}. The files are filler: do not describe them. After the last "
+                 f"one, start your reply with the code word {loop}, then write one sentence about a city whose name "
+                 f"starts with {loop[0]}.", timeout=600)
+    used.append(loop)
+    entries = session.entries()
+    check(len(boundaries(entries)) == count + 1, "Claude Code auto-compacted during the turn")
+    if len(boundaries(entries)) != count + 1:
+        return None
+    # Kept messages are written again after the boundary with their own
+    # timestamps, so the order is read from timestamps, not file positions.
+    boundary = boundaries(entries)[-1]["timestamp"]
+    asked = min((e["timestamp"] for e in entries if e.get("type") == "user" and f"Code word {loop}." in text_of(e)), default=None)
+    replied = max((e["timestamp"] for e in entries if e.get("type") == "assistant"
+                   and WORD_RE.match(text_of(e).lstrip(" *#")) and WORD_RE.match(text_of(e).lstrip(" *#")).group(1) == loop), default=None)
+    # Each call once: the kept ones appear again, as copies, after the summary.
+    calls = sorted({b["id"]: e["timestamp"] for e in entries if e.get("type") == "assistant" and asked and e["timestamp"] > asked
+                    for b in (e.get("message") or {}).get("content") or [] if isinstance(b, dict) and b.get("type") == "tool_use"}.values())
+    check(asked is not None and replied is not None and asked < boundary < replied,
+          "the compaction came inside the turn, between its prompt and its reply",
+          f"{sum(c < boundary for c in calls)} tool calls before it, {sum(c > boundary for c in calls)} after")
+    check(replied is not None, "the turn finished after the compaction", f"reply {loop}" if replied else "no reply")
+    for line in compaction_path(debug):
+        log(f"path: {line}")
+    # The kept part here can lie wholly inside the loop turn: one reply.
+    return verify(session, check, "auto", used, debug, least=1)
+
+
 def scenario_auto(session, check, log, filler, debug):
     threshold, shown = threshold_of(session)
     log(f"auto-compaction threshold: {shown[0]}k tokens, {shown[1]}% of a {shown[2]}k window" if shown else "auto-compaction threshold: not shown")
@@ -476,7 +559,7 @@ def scenario_auto(session, check, log, filler, debug):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default"],
+    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default", "auto-midturn"],
                         help="auto: threshold from CLAUDE_CODE_AUTO_COMPACT_WINDOW; auto-setting: from the "
                              "autoCompactWindow setting /autocompact writes; auto-default: Claude Code's own")
     parser.add_argument("--keep", action="store_true", help="leave the tmux session running afterwards")
@@ -487,7 +570,7 @@ def main():
     os.makedirs(os.path.join(work, ".claude"))
     is_auto = args.scenario.startswith("auto")
     # The person's own settings stay out: project settings carry what the test needs.
-    settings = {"autoCompactEnabled": is_auto, "permissions": {"allow": ["Bash(echo:*)"]}}
+    settings = {"autoCompactEnabled": is_auto, "permissions": {"allow": ["Bash(echo:*)", "Bash(cat:*)"]}}
     if args.scenario == "auto-setting":
         settings["autoCompactWindow"] = 100000
     with open(os.path.join(work, ".claude", "settings.json"), "w") as f:
@@ -497,7 +580,7 @@ def main():
     debug = os.path.join(work, "debug.txt")
     claude_args = ["--model", MODEL, "--permission-mode", "default", "--setting-sources", "project", "--settings", flags,
                    "--strict-mcp-config", "--tools", "Bash", "--plugin-dir", REPO, "--debug-file", debug]
-    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario == "auto" else {}
+    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario in ("auto", "auto-midturn") else {}
 
     def log(message):
         print(f"  ...   {message}", flush=True)
@@ -512,7 +595,9 @@ def main():
         for i in ATTACHED:
             with open(os.path.join(work, f"notes{i}.txt"), "w") as f:
                 f.writelines(f"note {i}.{n:04d}: a reference line the end-to-end test attaches; nothing to act on.\n" for n in range(200))
-        if is_auto:
+        if args.scenario == "auto-midturn":
+            kept = scenario_midturn(session, check, log, os.path.join(work, "filler.txt"), debug, work)
+        elif is_auto:
             kept = scenario_auto(session, check, log, os.path.join(work, "filler.txt"), debug)
         else:
             kept = scenario_manual(session, check, log, debug)
