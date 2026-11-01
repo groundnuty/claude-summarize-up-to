@@ -7,6 +7,8 @@ const NAME = 'summarize-up-to'
 const SHOWN = 50
 // After a dropped prompt is back in the box.
 const REFILL_MS = 300
+// After a start, a resume or a reload, before checking compaction reaches the mod.
+const STARTUP_MS = 3000
 // After the cut is on disk, then once more for anything written late.
 const RELINK_MS = [3000, 15000]
 const RELINK_TRIES = 5
@@ -199,10 +201,23 @@ const DEFAULT_PERCENT = 65
 let auto = { isOn: false, percent: DEFAULT_PERCENT }
 
 const UNREACHED = [
-  'Not armed: in this session Claude Code keeps compaction away from user mods, so /compact would summarize the whole conversation.',
-  "That is Claude Code's built-in security default (cc-plugin-sec-default), seated in Team and Enterprise organizations and on machines with managed settings.",
-  'An administrator can seat the mod ahead of it with managed prependPlugins.',
+  'Not cutting: in this session Claude Code keeps compaction away from user mods, so a compaction here summarizes the whole conversation.',
+  `A /compact you type is held back; /compact full summarizes everything. An auto-compaction cannot be held back: it summarizes everything.`,
+  "That is Claude Code's built-in security default (cc-plugin-sec-default), seated in Team and Enterprise organizations and on machines with managed settings, and once seated it holds until the session ends.",
+  'Restart the session under a personal login on a machine without managed settings (/exit, then claude --resume <id>), or have an administrator seat the mod ahead of it with managed prependPlugins.',
 ].join('\n')
+
+// What a held-back /compact says, with the way to cut and the way not to.
+async function heldBack($: EngineInterface): Promise<string> {
+  const id = await $.session.id().catch(() => '<session id>')
+  const share = await standingShare($).catch(() => ({ percent: plainDefault, isSet: false }))
+
+  return [
+    `held back /compact: in this session Claude Code keeps compaction away from user mods (its security default, cc-plugin-sec-default), so it would summarize the whole conversation, not the oldest ${share.percent}%.`,
+    `To cut, restart this session under a personal login on a machine without managed settings: /exit, then claude --resume ${id} in this folder; /${NAME} status then says compaction reaches this mod.`,
+    'To summarize everything anyway: /compact full',
+  ].join('\n')
+}
 
 // A settings read raises settings.read, which the security default passes
 // over exactly where it passes over session.compact.
@@ -297,12 +312,17 @@ async function answer($: EngineInterface, args: string): Promise<string> {
           ? 'auto-compaction is off'
           : `Claude Code auto-compacts at ${Math.round(window.autoCompactThreshold / 1000)}k tokens (${Math.round((100 * window.autoCompactThreshold) / window.rawMaxTokens)}% of ${Math.round(window.rawMaxTokens / 1000)}k)`
 
+    // Where compaction cannot reach the mod, that leads: the shares below it
+    // would not apply.
+    const isReached = await probe($)
+
     return [
+      ...(isReached ? [] : [UNREACHED, '']),
       shareLine(await standingShare($)),
       ...(armed !== undefined ? [`Armed for the next /compact only: everything before ${armed.described}.`] : []),
       `Partial auto-compaction: ${auto.isOn ? `on, summarizing the oldest ${auto.percent}%` : 'off'} (/config: ${NAME} options).`,
       `${at}; the context is ${context?.percent ?? '?'}% full. Set the threshold with /autocompact, e.g. /autocompact 900k.`,
-      (await probe($)) ? 'Compaction reaches this mod in this session.' : UNREACHED,
+      ...(isReached ? ['Compaction reaches this mod in this session.'] : []),
       (await $.process.run(['python3', '--version']).then(r => r.exitCode === 0, () => false))
         ? 'python3 is here to save each cut so that a restart or resume keeps it.'
         : 'python3 is missing: a cut works, but a restart or resume would lose it. Install Python 3 before cutting.',
@@ -367,9 +387,30 @@ export const register: Register = (on, options) => {
       description: 'Set the share every /compact summarizes, keeping the rest verbatim; or cut once at a listed point',
       argumentHint: '[n% | #n | cancel | status] [notes]',
     })
+    // A start, a resume or a reload under Claude Code's security default:
+    // said at once, before anyone compacts. Once the session has settled.
+    $.clock.after(STARTUP_MS, () => {
+      void probe($).then(
+        isReached => (isReached ? undefined : $.ui.log(UNREACHED)),
+        () => undefined,
+      )
+    })
 
     return next(e)
   })
+
+  // Where Claude Code's security default keeps compaction away from this mod,
+  // /compact would summarize everything. Commands reach the mod through
+  // command.run, which the default does not pass over: /compact is held back
+  // there, so a forgotten guard cannot cost a curated context. "/compact full"
+  // runs, as a plain one where the mod cannot cut.
+  on('command.run', { command: 'compact' }, async ($, e, next) => {
+    const isFull = /^full$/i.test(e.args.trim())
+    if (await probe($)) return next(e)
+    if (isFull) return next({ ...e, args: '' })
+
+    return { text: await heldBack($) }
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: NAME }, async ($, e) => ({ text: await answer($, e.args) })).catch(() => ({
     text: `${NAME} failed; nothing was armed.`,
@@ -491,7 +532,8 @@ export const register: Register = (on, options) => {
         (keptFrom < at.index
           ? `, and so ${at.index - keptFrom === 1 ? 'is the message' : `are the ${at.index - keptFrom} messages`} before it, which Claude Code kept: verbatim text starts at "${previewAt(e.messages, keptFrom)}".`
           : '.') +
-        (isStanding ? ` Every /compact here summarizes the oldest ${standing.percent}%, until you set another share.` : ''),
+        (isStanding ? ` Every /compact here summarizes the oldest ${standing.percent}%, until you set another share.` : '') +
+        " Claude Code's status line shows 0% until the next answer; /context counts the context now.",
     )
     $.clock.after(RELINK_MS[0] ?? 3000, () => void relink($, since))
 

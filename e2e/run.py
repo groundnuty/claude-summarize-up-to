@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,11 +44,12 @@ class Session:
     """One interactive Claude Code in a detached tmux session, always named
     exactly ("=name"): tmux otherwise matches a prefix, another run's session."""
 
-    def __init__(self, name, cwd, args, env, log):
+    def __init__(self, name, cwd, args, env, log, wrap=()):
         self.name, self.cwd, self.log = name, cwd, log
         self.projects = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd)))
         tmux("kill-session", "-t", f"={name}")
-        command = " ".join(["env"] + [f"{k}={v}" for k, v in env.items()] + [CLAUDE] + [quote(a) for a in args])
+        command = " ".join(["env"] + [f"{k}={v}" for k, v in env.items()] + [quote(w) for w in wrap] + [CLAUDE]
+                           + [quote(a) for a in args])
         tmux("new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", cwd, command)
         # A tmux set to "window-size latest" sizes a detached window after other
         # clients (102x11 on one machine), whatever -x and -y say; resizing it
@@ -534,6 +536,48 @@ def scenario_midturn(session, check, log, filler, debug, work):
     return verify(session, check, "auto", used, debug, least=1)
 
 
+def ui_logged(debug, text):
+    return any("[summarize-up-to] $.ui.log" in line and text in line for line in open(debug, errors="replace"))
+
+
+def scenario_guarded(session, check, log, debug):
+    """Claude Code's security default seated, as for Team and Enterprise logins
+    (a test policy, seen by this session alone): compaction cannot reach the
+    mod, so it warns at once and holds back a typed /compact, which would
+    summarize everything; /compact full goes through."""
+    seated = any("sec-default@builtin seated" in line for line in open(debug, errors="replace"))
+    check(seated, "Claude Code's security default is seated (a test policy, in this session alone)")
+    time.sleep(6)
+    check(ui_logged(debug, "Not cutting: in this session Claude Code keeps compaction away"), "the mod warns at once that it cannot cut here")
+    for word in WORDS[:3]:
+        session.send(f"Start your reply with the code word {word}, then write two sentences about a city whose name "
+                     f"starts with {word[0]}.")
+    session.send("/summarize-up-to status")
+    check("Not cutting:" in re.sub(r"\s+", " ", session.pane()), "the status leads with that warning")
+
+    count = len(boundaries(session.entries()))
+    session.send("/compact", quiet=True)
+    time.sleep(5)
+    check(len(boundaries(session.entries())) == count, "a typed /compact is held back: no compaction")
+    said = [text_of(e) or str(e.get("content", "")) for e in session.entries() if e.get("type") == "system"]
+    check(any("held back /compact: in this session Claude Code keeps compaction away" in t for t in said),
+          "it says why, and how to cut or to summarize everything")
+    check(session.box() == "", "the box is empty afterwards", repr(session.box()))
+
+    session.send(" /compact", quiet=True)
+    time.sleep(5)
+    check(session.box() == "/compact", "' /compact' typed after a space comes back as /compact", repr(session.box()))
+    session.send("", quiet=True)
+    time.sleep(5)
+    check(len(boundaries(session.entries())) == count, "sent as /compact, it is held back too: no compaction")
+
+    session.send("/compact full", timeout=300)
+    entries = session.entries()
+    check(len(boundaries(entries)) == count + 1 and not kept_replies(entries), "/compact full summarizes everything",
+          f"{len(kept_replies(entries))} replies kept")
+    return None
+
+
 def scenario_auto(session, check, log, filler, debug):
     threshold, shown = threshold_of(session)
     log(f"auto-compaction threshold: {shown[0]}k tokens, {shown[1]}% of a {shown[2]}k window" if shown else "auto-compaction threshold: not shown")
@@ -563,9 +607,10 @@ def scenario_auto(session, check, log, filler, debug):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default", "auto-midturn"],
+    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default", "auto-midturn", "guarded"],
                         help="auto: threshold from CLAUDE_CODE_AUTO_COMPACT_WINDOW; auto-setting: from the "
-                             "autoCompactWindow setting /autocompact writes; auto-default: Claude Code's own")
+                             "autoCompactWindow setting /autocompact writes; auto-default: Claude Code's own; "
+                             "guarded: Claude Code's security default seated (Linux, bwrap)")
     parser.add_argument("--keep", action="store_true", help="leave the tmux session running afterwards")
     parser.add_argument("--tag", default="", help="a suffix for the tmux session name, to run copies side by side")
     args = parser.parse_args()
@@ -585,6 +630,16 @@ def main():
     claude_args = ["--model", MODEL, "--permission-mode", "default", "--setting-sources", "project", "--settings", flags,
                    "--strict-mcp-config", "--tools", "Bash", "--plugin-dir", REPO, "--debug-file", debug]
     env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario in ("auto", "auto-midturn") else {}
+    wrap = ()
+    if args.scenario == "guarded":
+        # A policy with one inert setting, at /etc/claude-code for this session alone.
+        if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
+            sys.exit("the guarded scenario needs Linux with bwrap")
+        policy = os.path.join(work, "policy")
+        os.makedirs(policy)
+        with open(os.path.join(policy, "managed-settings.json"), "w") as f:
+            json.dump({"env": {"SUT_E2E_POLICY": "1"}}, f)
+        wrap = (sys.executable, os.path.join(REPO, "e2e", "guarded.py"), policy)
 
     def log(message):
         print(f"  ...   {message}", flush=True)
@@ -595,11 +650,13 @@ def main():
     try:
         name = (f"sut-e2e-{args.scenario}" + (f"-{MODEL.replace('claude-', '')}" if "E2E_MODEL" in os.environ else "")
                 + (f"-{args.tag}" if args.tag else ""))
-        session = Session(name, work, claude_args, env, log)
+        session = Session(name, work, claude_args, env, log, wrap)
         for i in ATTACHED:
             with open(os.path.join(work, f"notes{i}.txt"), "w") as f:
                 f.writelines(f"note {i}.{n:04d}: a reference line the end-to-end test attaches; nothing to act on.\n" for n in range(200))
-        if args.scenario == "auto-midturn":
+        if args.scenario == "guarded":
+            kept = scenario_guarded(session, check, log, debug)
+        elif args.scenario == "auto-midturn":
             kept = scenario_midturn(session, check, log, os.path.join(work, "filler.txt"), debug, work)
         elif is_auto:
             kept = scenario_auto(session, check, log, os.path.join(work, "filler.txt"), debug)

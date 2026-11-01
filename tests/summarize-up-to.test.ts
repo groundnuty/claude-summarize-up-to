@@ -667,7 +667,7 @@ test('after a cut, the mod says what Claude Code kept of the part before it', as
   // The closing message is dropped; the real reply stays, and is reported.
   expect(done.messages?.map(m => m.handle ?? m.text)).toEqual(['SUMMARY', 'h5', 'h6', 'h7'])
   const said = logs.find(text => text.startsWith('summarized everything before'))
-  expect(said).toMatch(/and so is the message before it, which Claude Code kept: verbatim text starts at "w+…"\.$/)
+  expect(said).toMatch(/and so is the message before it, which Claude Code kept: verbatim text starts at "w+…"\. Claude Code's status line shows 0% until the next answer; \/context counts the context now\.$/)
 })
 
 test('the confirmation counts tokens with the token-count API where Claude Code offers it', async ($, on) => {
@@ -751,4 +751,32 @@ test('until a share is set, /compact uses the /config default; a listed cut over
   const atDefault = (seen?.messages ?? []).filter(m => m.text !== CLOSING).length
   expect(atDefault).toBeGreaterThan(1)
   expect(atDefault).toBeLessThan(SOLO.length / 2)
+})
+
+// The refusal needs Claude Code's security default seated, which the test kit
+// cannot seat (the end-to-end "guarded" scenario does): here, where compaction
+// reaches the mod, /compact runs as typed and nothing warns.
+test('where compaction reaches the mod, /compact runs as typed and nothing warns', async ($, on) => {
+  const logs: string[] = []
+  const ran: string[] = []
+  const clock = mock.clock(on)
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+
+    return { value: undefined }
+  })
+  on('command.run', { command: 'compact' }, (_, e) => {
+    ran.push(e.args)
+
+    return { text: 'Compacted' }
+  })
+
+  await clock.advance(5000)
+  for (const args of ['', 'full', 'keep the API decisions']) {
+    const done = await $.command.run({ ...typed(args), command: 'compact' })
+    expect(done.text).toBe('Compacted')
+  }
+
+  expect(ran).toEqual(['', 'full', 'keep the API decisions'])
+  expect(logs.filter(text => text.startsWith('Not cutting') || text.startsWith('held back /compact'))).toEqual([])
 })

@@ -1,6 +1,6 @@
 {
   "name": "summarize-up-to",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Summarize the conversation up to any point, inside long agent-driven turns too, keeping everything after it verbatim; optionally make auto-compaction do the same",
   "author": { "name": "groundnuty" },
   "license": "MIT",

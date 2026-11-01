@@ -93,7 +93,17 @@ Claude Code can also compute an auto-compaction ahead of time and install it at 
 
 ## Team and Enterprise organizations
 
-For Team and Enterprise logins, and on machines with managed settings, Claude Code loads a built-in guard (`cc-plugin-sec-default`). The guard keeps compaction away from mods a user installs. There the mod refuses to cut and explains why, rather than starting a full compaction. An administrator can let it run by installing it as an organization mod, with the guard kept for every other mod. That means placing a clone of this repository at an admin-only path on each machine and setting:
+For Team and Enterprise logins, and on machines with managed settings, Claude Code loads a built-in guard (`cc-plugin-sec-default`). The guard keeps compaction away from mods a user installs, so any compaction there would summarize the whole conversation. Once seated, it holds until the session ends. Switching to a personal login or reloading plugins does not remove it; only a restart under a personal login on a machine without managed settings does.
+
+Where the guard stands in the mod's way, the mod says so and protects a typed `/compact`:
+
+- **When it loads,** including after `/reload-plugins` or a resume, it writes "Not cutting: …" into the conversation.
+- **`/summarize-up-to status`** leads with that warning.
+- **A typed `/compact` is held back**, with the reason and the restart command for this session. Claude Code runs `/compact` through `command.run`, which the guard does not keep from user mods.
+- **`/compact full`** goes through and summarizes everything.
+- **Auto-compaction cannot be held back:** with auto-compaction on, it summarizes everything there.
+
+An administrator can let the mod run by installing it as an organization mod, with the guard kept for every other mod. That means placing a clone of this repository at an admin-only path on each machine and setting:
 
 ```json
 {
@@ -112,7 +122,8 @@ See [Manage mods for your organization](https://code.claude.com/docs/en/plugins/
 - Cut points come from what Claude Code shows mods. Messages from other sessions are hidden from mods, so neither they nor the first reply after them are cut points. The steps between tool calls in the turns they start are.
 - Verbatim text starts at the cut. On one route Claude Code keeps more of what precedes it: compacting directly (200k-window models, auto-compaction), it kept two more replies. After each cut, the mod reports where verbatim text actually starts and the share actually summarized.
 - If anything goes wrong mid-cut, the conversation is left as it was.
-- Claude Code records the part summarized as the compaction's `preTokens`, and its own estimate of the rest as `postTokens`. The model's input after a cut is what the status line shows.
+- Claude Code records the part summarized as the compaction's `preTokens`, and its own estimate of the rest as `postTokens`.
+- After any compaction, Claude Code's status line shows 0% until the next answer, which can look like a full compaction. `/context` counts the context at once.
 - The mod's debug-log lines (`claude --debug`) say where each cut fell, both in the rows and in the conversation as the model reads it.
 - Claude Code 2.1.302 shows a dropped prompt's reason only for a moment. It draws the mod's transcript line for a held-back ` /compact` only once the command menu that `/compact` opens in the box closes, and it shows line breaks in such lines as `�`. 2.1.314 shows all of them as written.
 
