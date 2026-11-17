@@ -1,6 +1,6 @@
 {
   "name": "summarize-up-to",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Summarize the conversation up to any point, inside long agent-driven turns too, keeping everything after it verbatim; optionally make auto-compaction do the same",
   "author": { "name": "groundnuty" },
   "license": "MIT",
@@ -18,8 +18,8 @@
     "auto_compact": {
       "type": "boolean",
       "title": "Partial auto-compaction",
-      "description": "When Claude Code auto-compacts, summarize only the oldest share of the conversation and keep the rest verbatim. Set when it fires with /autocompact or CLAUDE_AUTOCOMPACT_PCT_OVERRIDE.",
-      "default": false
+      "description": "When Claude Code auto-compacts, summarize only the oldest share of the conversation and keep the rest verbatim. On by default, so a session whose options are lost, as when a settings refresh drops the source that set them, still cuts. Set when it fires with /autocompact or CLAUDE_AUTOCOMPACT_PCT_OVERRIDE.",
+      "default": true
     },
     "summarize_percent": {
       "type": "number",

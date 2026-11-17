@@ -9,6 +9,8 @@ const SHOWN = 50
 const REFILL_MS = 300
 // After a start, a resume or a reload, before checking compaction reaches the mod.
 const STARTUP_MS = 3000
+// Between checks at turn starts that compaction still reaches the mod.
+const RECHECK_MS = 10 * 60_000
 // After the cut is on disk, then once more for anything written late.
 const RELINK_MS = [3000, 15000]
 const RELINK_TRIES = 5
@@ -196,9 +198,14 @@ let cutting = false
 let reached = false
 const reachedNow = (): boolean => reached
 
-// The userConfig options, read at each (re)load: /config changes reload.
+// The userConfig options, read at each (re)load: /config changes reload, and
+// so does a settings refresh that changes them. Their defaults cut: a session
+// whose options are lost still cuts the oldest 65%.
 const DEFAULT_PERCENT = 65
-let auto = { isOn: false, percent: DEFAULT_PERCENT }
+let auto = { isOn: true, percent: DEFAULT_PERCENT }
+// The last check that compaction reaches the mod, and whether it said it does not.
+let checkedAt = 0
+let isUnreachedSaid = false
 
 const UNREACHED = [
   'Not cutting: in this session Claude Code keeps compaction away from user mods, so a compaction here would summarize the whole conversation.',
@@ -237,6 +244,18 @@ const NOT_SWITCHED_OFF = `The mod could not switch compaction off here: a /compa
 // Compaction reaches the mod, yet none can start: the variable outlives the
 // guard's reason for it, as when a machine policy seats the mod after a reload.
 const OFF_HERE = `Compaction is off in this session (${OFF}=1, from its environment or from this mod while the session was guarded; nothing but a restart undoes it): no compaction runs here, this mod's cuts included, and /compact is an unknown command. Restart the session to switch it on: /exit, then claude --resume <id>.`
+
+// Whether compaction still reaches the mod. Where it does not, compaction is
+// switched off and that said, once per load; at a session's start, compaction
+// switched off earlier is said too.
+async function check($: EngineInterface, isStart: boolean): Promise<void> {
+  checkedAt = Date.now()
+  if (!(await probe($))) {
+    if (isUnreachedSaid) return
+    isUnreachedSaid = true
+    $.ui.log(`${UNREACHED}\n${await switchOff($)}`)
+  } else if (isStart && (await isCompactionOff($))) $.ui.log(OFF_HERE)
+}
 
 // What a held-back /compact says, with the way to cut and the way not to.
 async function heldBack($: EngineInterface): Promise<string> {
@@ -401,8 +420,10 @@ async function answer($: EngineInterface, args: string): Promise<string> {
 }
 
 export const register: Register = (on, options) => {
+  checkedAt = 0
+  isUnreachedSaid = false
   auto = {
-    isOn: options.auto_compact === true,
+    isOn: options.auto_compact !== false,
     percent: typeof options.summarize_percent === 'number' ? options.summarize_percent : DEFAULT_PERCENT,
   }
   plainDefault = typeof options.compact_percent === 'number' ? options.compact_percent : DEFAULT_PERCENT
@@ -423,15 +444,19 @@ export const register: Register = (on, options) => {
     // A start, a resume or a reload under Claude Code's security default:
     // compaction is switched off and that said at once, before anything
     // compacts. Once the session has settled.
-    $.clock.after(STARTUP_MS, () => {
-      void (async () => {
-        if (!(await probe($))) $.ui.log(`${UNREACHED}\n${await switchOff($)}`)
-        else if (await isCompactionOff($)) $.ui.log(OFF_HERE)
-      })().catch(() => undefined)
-    })
+    $.clock.after(STARTUP_MS, () => void check($, true).catch(() => undefined))
 
     return next(e)
   })
+
+  // A reload can change what reaches the mod without a session start, as when
+  // a settings refresh changes the managed settings. So the check also runs at
+  // turn starts: at the first after a load, then every RECHECK_MS.
+  on('turn.start', async ($, e, next) => {
+    if (Date.now() - checkedAt >= RECHECK_MS) void check($, false).catch(() => undefined)
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // Where Claude Code's security default keeps compaction away from this mod,
   // /compact would summarize everything. Commands reach the mod through
@@ -506,7 +531,14 @@ export const register: Register = (on, options) => {
     }
     const isAuto = manual === undefined && e.trigger === 'auto' && auto.isOn
     const cut = manual ?? (isAuto ? { want: { percent: auto.percent } as Want, notes: '' } : undefined)
-    if (cut === undefined) return next(e)
+    if (cut === undefined) {
+      // Partial auto-compaction set off: said, so a whole-conversation summary
+      // never passes unremarked.
+      if (manual === undefined && e.trigger === 'auto')
+        $.ui.log(`auto-compaction summarized the whole conversation: partial auto-compaction is off in this session's options (/config: ${NAME} options).`)
+
+      return next(e)
+    }
 
     const api = await apiOf($)
     const at = pick(viewOf(e.messages, api, 'percent' in cut.want).cuts, cut.want)

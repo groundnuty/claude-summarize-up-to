@@ -302,7 +302,9 @@ test('with partial auto-compaction on, an auto-compaction keeps the newest 35% v
   expect(logs.at(-1)).toMatch(/^auto-compaction summarized everything before the step/)
 })
 
-test('with partial auto-compaction off, an auto-compaction passes through whole', async ($, on) => {
+const AUTO_OFF = { options: { auto_compact: false } }
+
+test('with partial auto-compaction set off, an auto-compaction passes through whole', AUTO_OFF, async ($, on) => {
   let seen: SessionCompactInput | undefined
   on('session.compact', (_, e) => {
     seen = e
@@ -631,7 +633,7 @@ test('with partial auto-compaction on, a precompute is declined; off, it passes 
   expect(triggers).toEqual([])
 })
 
-test('without partial auto-compaction, a precompute passes through whole', async ($, on) => {
+test('with partial auto-compaction set off, a precompute passes through whole', AUTO_OFF, async ($, on) => {
   let seen: SessionCompactInput | undefined
   on('session.compact', (_, e) => {
     seen = e
@@ -803,4 +805,37 @@ test('DISABLE_COMPACT=0 keeps compaction on: nothing warns', async ($, on) => {
 
   const status = await $.command.run(typed('status'))
   expect(status.text).not.toMatch(/Compaction is off/)
+})
+
+// Lost options come back as the defaults, as after a settings refresh that
+// drops the source that set them: the defaults still cut.
+test('with no options set, an auto-compaction still cuts the oldest 65%', async ($, on) => {
+  let seen: SessionCompactInput | undefined
+  on('session.compact', (_, e) => {
+    seen = e
+
+    return { messages: [assistant('summary', 's1')] }
+  })
+  on('session.messages', () => ({ value: ROWS }))
+
+  const done = await $.session.compact({ trigger: 'auto', messages: ROWS })
+
+  expect(seen?.messages.length).toBeLessThan(ROWS.length)
+  expect(done.messages?.length).toBeLessThan(ROWS.length + 1)
+  const listed = await $.command.run(typed('status'))
+  expect(listed.text).toMatch(/Partial auto-compaction: on, summarizing the oldest 65%/)
+})
+
+test('with partial auto-compaction set off, a whole-conversation auto-compaction is said', AUTO_OFF, async ($, on) => {
+  const logs: string[] = []
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+
+    return { value: undefined }
+  })
+  on('session.compact', (_, e) => ({ messages: [assistant('summary', 's1')] }))
+
+  await $.session.compact({ trigger: 'auto', messages: ROWS })
+
+  expect(logs).toContain('auto-compaction summarized the whole conversation: partial auto-compaction is off in this session\'s options (/config: summarize-up-to options).')
 })

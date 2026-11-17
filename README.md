@@ -72,13 +72,15 @@ python3 tools/relink.py --session <session id> --write      # or write a repaire
 
 ### Partial auto-compaction
 
-Turn on **Partial auto-compaction** in `/config` (the mod's options), and set **Share to summarize** (default 65%), which is separate from the share for `/compact`. From then on, every auto-compaction summarizes that share of the oldest conversation and keeps the rest verbatim. Claude Code still decides when to compact. To compact at 90% of a 1M-token window:
+**Partial auto-compaction** is on by default: every auto-compaction summarizes the oldest 65% of the conversation and keeps the rest verbatim. Set the share with **Share to summarize** in `/config` (the mod's options); it is separate from the share for `/compact`. Claude Code still decides when to compact. To compact at 90% of a 1M-token window:
 
 ```
 /autocompact 900k
 ```
 
-Auto-compaction has to be on (`autoCompactEnabled`), and Claude Code doesn't auto-compact headless sessions. If no suitable cut exists, or the summarizer refuses the older part, that auto-compaction runs as Claude Code's normal full one, so a session never gets stuck at the limit.
+Auto-compaction has to be on (`autoCompactEnabled`), and Claude Code doesn't auto-compact headless sessions. If no suitable cut exists, or the summarizer refuses the older part, that auto-compaction runs as Claude Code's normal full one, so a session never gets stuck at the limit. The mod says so in the conversation, as it does when an auto-compaction summarizes everything because partial auto-compaction is set off.
+
+Partial auto-compaction is on by default because options can be lost. Claude Code re-reads managed settings at every start and at an hourly refresh in a running session. If the source that set the options stops applying (for example, the machine policy is ignored once a login's organization sends settings of its own), the mod is reloaded with its defaults. Those defaults still cut. To keep your own share through such a loss, set it in your user settings as well; `tools/machine-policy.sh fallback` does that.
 
 Claude Code reaches an auto-compaction by more than one route. The end-to-end tests cover each route with a real restart and resume after the cut:
 
@@ -111,7 +113,7 @@ bash tools/machine-policy.sh update <git ref>
 bash tools/machine-policy.sh remove
 ```
 
-Its limit is the organization's. Managed sources are "first-wins": under a login whose organization delivers server-managed settings, even one key, Claude Code ignores the machine file, and a lower source can't opt into merging with the one above it. So the tool also installs the mod in each project you name, as a fallback: under such a login that install loads behind the guard and switches compaction off. The agent then stops at the context limit instead of compacting everything. To cut under that login, its organization has to seat the mod. Keep it out of an account switcher's rotation if it can't.
+Its limit is the organization's. Managed sources are "first-wins": under a login whose organization delivers server-managed settings, even one key, Claude Code ignores the machine file, and a lower source can't opt into merging with the one above it. That applies at a session's start and at the hourly settings refresh of a running session alike. So the tool also sets up a fallback (alone: `machine-policy.sh fallback <percent>`, no sudo): the mod installed from GitHub for all of your projects, and your share in your user settings for both copies. Under such a login the GitHub copy loads behind the guard and switches compaction off, so the agent stops at the context limit instead of compacting everything. In a running session whose refresh drops the machine file, the mod keeps your share from user settings. To cut under that login, its organization has to seat the mod. Keep it out of an account switcher's rotation if it can't.
 
 Restart running sessions after installing the policy. Where the policy applies, the current Claude Code loads only the machine's copy, and a reload stays clean (tested on 2.1.316). A `/reload-plugins` in a process still on 2.1.302 loaded both copies, and the one behind the guard switched compaction off until a restart.
 

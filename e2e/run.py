@@ -394,14 +394,21 @@ def scenario_manual(session, check, log, debug):
     shown = reason in re.sub(r"\s+", " ", pane)
     # Claude Code 2.1.302 draws the line only once the box's command menu closes.
     logged = any("[summarize-up-to] $.ui.log:" in line and reason in line for line in open(debug, errors="replace"))
-    check(shown or logged, "' /compact' is held back with a reason",
-          "on screen" if shown else "in the transcript, not on screen yet" if logged else "nowhere")
     time.sleep(5)
     entries = session.entries()
-    check(sum(e.get("type") == "assistant" for e in entries) == replies and len(boundaries(entries)) == count,
-          "' /compact' reached neither the model nor compaction")
-    check(session.box() == "/compact", "the box now holds /compact without the space", repr(session.box()))
-    session.send("", timeout=300)
+    # As text, it would be a plain user message: as a command it carries <command-name>.
+    as_text = [e for e in entries if e.get("type") == "user" and re.fullmatch(r"\s*/compact\s*", text_of(e) or "")]
+    check(not as_text, "' /compact' did not reach the model as text")
+    if len(boundaries(entries)) > count:
+        # Newer Claude Code runs " /compact" as the command: no hold-back to test.
+        log("Claude Code ran ' /compact' as /compact itself")
+        session.wait_idle(300)
+    else:
+        check(shown or logged, "' /compact' is held back with a reason",
+              "on screen" if shown else "in the transcript, not on screen yet" if logged else "nowhere")
+        check(sum(e.get("type") == "assistant" for e in entries) == replies, "' /compact' reached neither the model nor compaction")
+        check(session.box() == "/compact", "the box now holds /compact without the space", repr(session.box()))
+        session.send("", timeout=300)
     kept = verify(session, check, "manual", words, debug)
 
     estimate = int(numbers.group(1)) * 1000 if numbers is not None and numbers.group(1) else None
@@ -618,7 +625,35 @@ def scenario_off(session, check, log, debug):
     return None
 
 
-def scenario_auto(session, check, log, filler, debug):
+def scenario_options_lost(session, check, log, filler, debug, flags_path):
+    """The 2026-11-16 event: options set at the start (50%) by managed settings,
+    then gone from them under the running session, as when a settings refresh
+    drops the source that set them. Claude Code reloads the mod with its
+    defaults, which cut the oldest 65%, so the next auto-compaction still cuts."""
+    session.send("/summarize-up-to status")
+    check("summarizing the oldest 50%" in re.sub(r"\s+", " ", session.pane()), "at the start, partial auto-compaction is on at 50%")
+    with open(flags_path, "r+") as f:
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps({"prependPlugins": []}) + "\n")
+    log("removed the options from the managed settings")
+    said = False
+    for word in ("ALPHA", "BRAVO"):
+        session.send(f"Start your reply with the code word {word}, then write one sentence about a city.")
+        said = any("options changed" in str(e.get("content", "")) for e in session.entries() if e.get("type") == "system")
+        if said:
+            break
+    check(said, "Claude Code reloads the mod with its options gone")
+    session.send("/summarize-up-to status")
+    check("summarizing the oldest 65%" in re.sub(r"\s+", " ", session.pane()), "the defaults apply: partial auto-compaction is on at 65%")
+    kept = scenario_auto(session, check, log, filler, debug, words=WORDS[2:])
+    reported = [re.search(r"before the [a-z ]+ at (\d+)%", str(e.get("content", ""))) for e in session.entries() if e.get("type") == "system" and "auto-compaction summarized everything" in str(e.get("content", ""))]
+    shares = [int(m.group(1)) for m in reported if m]
+    check(bool(shares) and 55 <= shares[-1] <= 75, "the auto-compaction cut at about 65%", f"{shares[-1] if shares else None}%")
+    return kept
+
+
+def scenario_auto(session, check, log, filler, debug, words=None):
     threshold, shown = threshold_of(session)
     log(f"auto-compaction threshold: {shown[0]}k tokens, {shown[1]}% of a {shown[2]}k window" if shown else "auto-compaction threshold: not shown")
     check(threshold is not None, "Claude Code reports an auto-compaction threshold")
@@ -627,7 +662,7 @@ def scenario_auto(session, check, log, filler, debug):
     # About ten turns to reach it, so a 65% cut has turns on both sides.
     write_filler(filler, threshold / 10)
     used = []
-    for word in WORDS:
+    for word in words or WORDS:
         count = len(boundaries(session.entries()))
         session.send(f"Code word {word}. Ignore the pasted filler; start your reply with the code word, then write "
                      f"two sentences about a city whose name starts with {word[0]}.", paste=filler, timeout=300)
@@ -647,7 +682,8 @@ def scenario_auto(session, check, log, filler, debug):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default", "auto-midturn", "guarded", "off"],
+    parser.add_argument("scenario", choices=["manual", "auto", "auto-setting", "auto-default", "auto-midturn", "auto-unset",
+                                             "options-lost", "guarded", "off"],
                         help="auto: threshold from CLAUDE_CODE_AUTO_COMPACT_WINDOW; auto-setting: from the "
                              "autoCompactWindow setting /autocompact writes; auto-default: Claude Code's own; "
                              "guarded: Claude Code's security default seated (Linux, bwrap); off: DISABLE_COMPACT=1 where compaction reaches the mod")
@@ -657,7 +693,7 @@ def main():
 
     work = tempfile.mkdtemp(prefix=f"sut-e2e-{args.scenario}-", dir="/tmp")
     os.makedirs(os.path.join(work, ".claude"))
-    is_auto = args.scenario.startswith("auto") or args.scenario == "guarded"
+    is_auto = args.scenario.startswith("auto") or args.scenario in ("guarded", "options-lost")
     # The person's own settings stay out: project settings carry what the test needs.
     settings = {"autoCompactEnabled": is_auto, "permissions": {"allow": ["Bash(echo:*)", "Bash(cat:*)"]}}
     if args.scenario == "auto-setting":
@@ -666,14 +702,33 @@ def main():
         json.dump(settings, f)
     options = {"auto_compact": is_auto, "summarize_percent": 65}
     flags = json.dumps({"pluginConfigs": {"summarize-up-to@inline": {"options": options}}})
+    flags_path = os.path.join(work, "flags.json")
+    if args.scenario == "auto-unset":
+        # No options anywhere: the mod's defaults.
+        flags = "{}"
+    elif args.scenario == "options-lost":
+        # Managed settings, which Claude Code re-reads under a running session,
+        # so that the run can take the options away; set below.
+        flags = "{}"
     debug = os.path.join(work, "debug.txt")
     claude_args = ["--model", MODEL, "--permission-mode", "default", "--setting-sources", "project", "--settings", flags,
                    "--strict-mcp-config", "--tools", "Bash", "--plugin-dir", REPO, "--debug-file", debug]
-    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"} if args.scenario in ("auto", "auto-midturn", "guarded") else {}
+    env = ({"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"}
+           if args.scenario in ("auto", "auto-midturn", "auto-unset", "options-lost", "guarded") else {})
     if args.scenario == "off":
         env = {"DISABLE_COMPACT": "1"}
     wrap = ()
-    if args.scenario == "guarded":
+    if args.scenario == "options-lost":
+        if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
+            sys.exit("the options-lost scenario needs Linux with bwrap")
+        policy = os.path.join(work, "policy")
+        os.makedirs(policy)
+        flags_path = os.path.join(policy, "managed-settings.json")
+        with open(flags_path, "w") as f:
+            json.dump({"prependPlugins": [], "pluginConfigs": {"summarize-up-to@inline": {"options": {
+                "auto_compact": True, "summarize_percent": 50}}}}, f)
+        wrap = (sys.executable, os.path.join(REPO, "e2e", "guarded.py"), policy)
+    elif args.scenario == "guarded":
         # A policy with one inert setting, at /etc/claude-code for this session alone.
         if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
             sys.exit("the guarded scenario needs Linux with bwrap")
@@ -682,6 +737,12 @@ def main():
         with open(os.path.join(policy, "managed-settings.json"), "w") as f:
             json.dump({"env": {"SUT_E2E_POLICY": "1"}}, f)
         wrap = (sys.executable, os.path.join(REPO, "e2e", "guarded.py"), policy)
+    elif os.path.isdir("/etc/claude-code") and sys.platform.startswith("linux") and shutil.which("bwrap"):
+        # A machine policy can seat an installed copy of the mod ahead of the
+        # copy under test: the test session does not see it.
+        env["E2E_WORK"] = work
+        wrap = ("env", f"E2E_WORK={work}", sys.executable, os.path.join(REPO, "e2e", "guarded.py"), "-")
+        print("  (the machine's /etc/claude-code is hidden from the test session)", flush=True)
 
     def log(message):
         print(f"  ...   {message}", flush=True)
@@ -700,6 +761,8 @@ def main():
             kept = scenario_guarded(session, check, log, debug, work)
         elif args.scenario == "off":
             kept = scenario_off(session, check, log, debug)
+        elif args.scenario == "options-lost":
+            kept = scenario_options_lost(session, check, log, os.path.join(work, "filler.txt"), debug, flags_path)
         elif args.scenario == "auto-midturn":
             kept = scenario_midturn(session, check, log, os.path.join(work, "filler.txt"), debug, work)
         elif args.scenario.startswith("auto"):
@@ -710,7 +773,7 @@ def main():
             # A restart: Claude Code rebuilds the conversation from the transcript.
             resumed = os.path.basename(session.transcript())[:-len(".jsonl")]
             session.exit()
-            session = Session(name, work, claude_args + ["--resume", resumed], env, log)
+            session = Session(name, work, claude_args + ["--resume", resumed], env, log, wrap)
             log(f"resumed {resumed}")
             quotes(session, check, *kept, after=" after a restart and resume")
             if args.scenario == "manual":

@@ -4,6 +4,7 @@
 # the fallback where the policy does not apply.
 #
 #   machine-policy.sh install <git ref> <percent> [project folder ...]
+#   machine-policy.sh fallback <percent> [project folder ...]
 #   machine-policy.sh update <git ref>
 #   machine-policy.sh remove
 #
@@ -13,8 +14,12 @@
 #
 # Under a login whose organization delivers server-managed settings, even one
 # key, Claude Code ignores this file ("first-wins"; a lower source cannot opt
-# into merging with the source above it). There the per-project install loads
-# instead, behind the guard: it cannot cut, so it switches compaction off.
+# into merging with the source above it), at a start and at the hourly
+# settings refresh of a running session alike. So the fallback (also alone,
+# without sudo): the GitHub copy installed for every project of this user,
+# which loads where the policy does not (behind the guard it cannot cut, so it
+# switches compaction off), and the share written into the user's settings for
+# both copies, so options the policy no longer supplies are not the defaults.
 # Its own marketplace name keeps the two apart: with the same name, adopting the
 # policy would merge the per-project installs into one that such a login drops.
 set -euo pipefail
@@ -27,6 +32,36 @@ OLD=/opt/claude-plugins/claude-summarize-up-to
 CLAUDE=$(command -v claude || echo /home/linuxbrew/.linuxbrew/bin/claude)
 
 say() { printf '%s\n' "$*"; }
+
+# The GitHub copy for every project, and the share in user settings for both
+# copies of the mod. User settings, unlike the policy, are always read.
+fallback() {
+  local percent=$1; shift
+  "$CLAUDE" plugin marketplace add groundnuty/claude-summarize-up-to 2>&1 | tail -1
+  "$CLAUDE" plugin marketplace update groundnuty 2>&1 | tail -1
+  # Installed where missing, else brought up to the marketplace's version.
+  (cd "$HOME" && { "$CLAUDE" plugin install summarize-up-to@groundnuty --scope user 2>&1 | grep -q 'already installed' \
+    && "$CLAUDE" plugin update summarize-up-to@groundnuty --scope user 2>&1 | tail -1 | cut -c1-120 || echo "   installed for every project"; })
+  for d in "$@"; do (cd "$d" && { "$CLAUDE" plugin install summarize-up-to@groundnuty --scope local 2>&1 | grep -q 'already installed' \
+    && "$CLAUDE" plugin update summarize-up-to@groundnuty --scope local 2>&1 | tail -1 | cut -c1-120 || echo "   installed in $d"; }); done
+  python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" "$percent" <<'PY'
+import json, os, shutil, sys, time
+path, percent = sys.argv[1], int(sys.argv[2])
+data = json.load(open(path)) if os.path.exists(path) else {}
+if os.path.exists(path):
+    shutil.copy2(path, path + ".bak-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+options = {"compact_percent": percent, "auto_compact": True, "summarize_percent": percent}
+configs = data.setdefault("pluginConfigs", {})
+for plugin in ("summarize-up-to@groundnuty", "summarize-up-to@machine-mods"):
+    configs.setdefault(plugin, {})["options"] = options
+# Written in place, so a settings file that is a symlink stays one.
+with open(path, "a+") as f:
+    f.seek(0)
+    f.truncate()
+    f.write(json.dumps(data, indent=2) + "\n")
+print(f"   user settings: both copies summarize the oldest {percent}%, partial auto-compaction on")
+PY
+}
 
 remove() {
   say "== removing the machine policy and the admin folder"
@@ -47,13 +82,19 @@ checkout() {
 
 case "${1:-}" in
   remove) remove; exit 0 ;;
+  fallback)
+    [ -n "${2:-}" ] || { say "usage: $0 fallback <percent> [project folder ...]"; exit 1; }
+    p=$2; shift 2
+    fallback "$p" "$@"
+    say "done. Restart running sessions, or /reload-plugins in them, to load it."
+    exit 0 ;;
   update)
     [ -n "${2:-}" ] || { say "usage: $0 update <git ref>"; exit 1; }
     checkout "$2"
     say "updated. /reload-plugins in a session loads it."
     exit 0 ;;
   install) ;;
-  *) say "usage: $0 install <git ref> <percent> [project folder ...] | update <git ref> | remove"; exit 1 ;;
+  *) say "usage: $0 install <git ref> <percent> [project folder ...] | fallback <percent> [project folder ...] | update <git ref> | remove"; exit 1 ;;
 esac
 
 REF=${2:?git ref}; PERCENT=${3:?percent}; shift 3
@@ -63,9 +104,8 @@ if [ -e "$POLICY" ] && ! sudo grep -q 'summarize-up-to@' "$POLICY"; then
 fi
 [ ! -e "$BASE" ] || { say "refusing: $BASE already exists; use update, or remove first; nothing changed"; exit 1; }
 
-say "== 1. the fallback: installed per project, from GitHub"
-"$CLAUDE" plugin marketplace add groundnuty/claude-summarize-up-to 2>&1 | tail -1
-for d in "$@"; do (cd "$d" && "$CLAUDE" plugin install summarize-up-to@groundnuty --scope local 2>&1 | tail -1 | cut -c1-120); done
+say "== 1. the fallback: the GitHub copy for every project, and the share in user settings"
+fallback "$PERCENT" "$@"
 
 say "== 2. the mod, root-owned, at $PLUGIN"
 sudo install -d -o root -g root -m 755 /opt/claude-plugins "$BASE" "$BASE/.claude-plugin"

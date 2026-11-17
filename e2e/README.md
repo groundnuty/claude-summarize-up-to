@@ -6,11 +6,13 @@ Run these before every release, on the Claude Code version you release for:
 python3 e2e/run.py manual
 python3 e2e/run.py auto
 python3 e2e/run.py auto-setting
+python3 e2e/run.py auto-unset
+python3 e2e/run.py options-lost   # Linux with bwrap
 python3 e2e/run.py off
 python3 e2e/run.py guarded        # Linux with bwrap
 ```
 
-On a machine with a machine policy, run only `guarded`: the policy's mod takes precedence over the repository's, so the others would test the installed copy.
+On Linux with `bwrap`, a machine policy (`/etc/claude-code`) is hidden from the test sessions (`guarded.py -`), because it would load an installed copy of the mod ahead of the copy under test. Elsewhere, run the scenarios on a machine without one.
 
 Each run starts a real, interactive Claude Code in a detached tmux session and a fresh folder under `/tmp`, with this repository loaded through `--plugin-dir`. It types a scripted conversation into it and compacts it. It then checks the result twice: in the session transcript, and by asking the model to quote, word for word, the replies it can still see. A run ends with `PASSED` or `FAILED (n)` and a non-zero exit code.
 
@@ -25,6 +27,8 @@ Each run starts a real, interactive Claude Code in a detached tmux session and a
 | each, then | `/exit`, and `claude --resume` of the same session in a fresh tmux session | The model again quotes exactly the kept replies and none of the summarized ones |
 | `manual`, then | `/summarize-up-to status`; four more turns; a plain `/compact`; `/compact full` | The 60% share still stands after the restart; the plain `/compact` cuts at it again, nothing re-armed; `/compact full` summarizes everything, no reply kept |
 | `guarded` | Claude Code's security default seated, as for a Team login: a test policy with one inert setting at `/etc/claude-code`, seen by this session alone (`e2e/guarded.py`), with auto-compaction on (window 100k). `/summarize-up-to status`; filler turns past the 67k threshold; `/compact`; ` /compact` typed after a space and Enter on what the box then holds; `/compact full` | The guard is seated. The mod warns when it loads, switches compaction off for the session, and says how to compact there anyway; the status leads with that warning and Claude Code reports auto-compaction off. Past the threshold nothing compacts, and no `/compact` runs, full or not. After `/reload-plugins` there is no false alarm about the switch, and the status still says compaction is off |
+| `auto-unset` | The `auto` scenario with no options set anywhere | The mod's defaults cut: partial auto-compaction at 65% |
+| `options-lost` | Options 50%, on, from managed settings (a test policy seen by this session alone, with the guard left out as `"prependPlugins": []`); the options are removed from it under the running session, as a settings refresh did on 2026-11-16; then the `auto` scenario. Linux with `bwrap` | Claude Code reloads the mod with its options gone; the status then shows the defaults (on, 65%); the auto-compaction cuts at about 65% |
 | `off` | `DISABLE_COMPACT=1` in a session compaction would reach, as after a reload under a machine policy that followed a guarded time. `/summarize-up-to status`; one turn; `/compact` | The mod warns when it loads; the status leads with that warning and still says compaction reaches the mod; `/compact` does not run |
 
 Each auto scenario first reads the threshold from `/summarize-up-to status` and sizes its pastes so that the compaction comes after about ten turns. It reports the route Claude Code took, from its debug log. `E2E_MODEL=claude-haiku-4-5` runs a scenario on a 200k-window model, where Claude Code's default auto-compaction compacts directly instead of reactively. On that model the confirmation's token figures can exceed the 1.6× bound (see the main README), so those runs show the route and the cut, not a release gate. `--tag x` names the tmux session apart, to run copies of one scenario side by side.
